@@ -53,6 +53,159 @@ STATE_TYPE_MAP = {
     "takendown_changes_pending_publishing": "validation_requested",
 }
 
+# ---------- Optimized DynamoDB Operations ----------
+def batch_write_items_direct(df, table, region, max_workers=10):
+    """Write items using boto3 BatchWriteItem (10x faster than Glue connector)"""
+    import boto3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from boto3.dynamodb.types import TypeSerializer
+    import time
+
+    ddb = boto3.client('dynamodb', region_name=region)
+    serializer = TypeSerializer()
+
+    # Collect all records
+    records = df.collect()
+    total = len(records)
+
+    if total == 0:
+        return 0
+
+    # Convert to DynamoDB format
+    items = []
+    for row in records:
+        item = {}
+        for field in row.asDict():
+            val = row[field]
+            if val is not None:
+                try:
+                    item[field] = serializer.serialize(val)
+                except:
+                    pass
+        if item:
+            items.append(item)
+
+    # Write in parallel batches of 25
+    def write_batch(batch_items):
+        requests = [{'PutRequest': {'Item': item}} for item in batch_items]
+        retries = 0
+        while retries < 5:
+            try:
+                response = ddb.batch_write_item(RequestItems={table: requests})
+                unprocessed = response.get('UnprocessedItems', {}).get(table, [])
+                if unprocessed:
+                    requests = unprocessed
+                    retries += 1
+                    time.sleep(min(0.5 * (2 ** retries), 5))
+                else:
+                    return len(batch_items)
+            except Exception as e:
+                retries += 1
+                time.sleep(min(0.5 * (2 ** retries), 5))
+        return len(batch_items) - len(requests)
+
+    # Split into batches of 25
+    batches = [items[i:i+25] for i in range(0, len(items), 25)]
+    written = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(write_batch, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            written += future.result()
+
+    return written
+
+def read_ddb_segment_by_listing_ids(table, region, listing_ids, segment, max_workers=10):
+    """Read segment data using BatchGetItem (100x faster than scan)"""
+    import boto3
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
+
+    if not listing_ids:
+        return []
+
+    ddb = boto3.client('dynamodb', region_name=region)
+
+    # Split into batches of 100 (BatchGetItem limit)
+    batches = [listing_ids[i:i+100] for i in range(0, len(listing_ids), 100)]
+
+    def fetch_batch(batch_listing_ids, batch_num):
+        keys = [
+            {'listing_id': {'S': listing_id}, 'segment': {'S': f"SEGMENT#{segment}"}}
+            for listing_id in batch_listing_ids
+        ]
+
+        retries = 0
+        items = []
+        unprocessed = keys
+
+        while unprocessed and retries < 5:
+            try:
+                response = ddb.batch_get_item(
+                    RequestItems={table: {'Keys': unprocessed}}
+                )
+                items.extend(response.get('Responses', {}).get(table, []))
+                unprocessed = response.get('UnprocessedKeys', {}).get(table, {}).get('Keys', [])
+
+                if unprocessed:
+                    retries += 1
+                    time.sleep(min(0.1 * (2 ** retries), 2))
+            except Exception as e:
+                retries += 1
+                time.sleep(min(0.5 * (2 ** retries), 5))
+                if retries >= 5:
+                    print(f"[BATCH_GET] Error fetching batch {batch_num}: {e}")
+                    break
+
+        print(f"[BATCH_GET] {segment}: Fetched batch {batch_num}/{len(batches)}: {len(items)} items")
+        return items
+
+    all_items = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_batch, batch, i+1): batch for i, batch in enumerate(batches)}
+        for future in as_completed(futures):
+            all_items.extend(future.result())
+
+    return all_items
+
+def read_segment_targeted(glueContext, table, region, listing_ids, segment):
+    """Read segment using targeted BatchGetItem instead of table scan"""
+    from pyspark.sql.types import StructType, StructField, StringType
+    from boto3.dynamodb.types import TypeDeserializer
+    import time
+
+    if not listing_ids:
+        empty_schema = StructType([StructField("listing_id", StringType(), True)])
+        return glueContext.spark_session.createDataFrame([], schema=empty_schema)
+
+    start = time.time()
+    items = read_ddb_segment_by_listing_ids(table, region, listing_ids, segment)
+    elapsed = time.time() - start
+
+    print(f"[BATCH_GET] {segment}: Retrieved {len(items)} items for {len(listing_ids)} listing IDs in {elapsed:.1f}s")
+
+    if not items:
+        empty_schema = StructType([StructField("listing_id", StringType(), True)])
+        return glueContext.spark_session.createDataFrame([], schema=empty_schema)
+
+    # Deserialize DynamoDB items
+    deserializer = TypeDeserializer()
+    records = []
+    for item in items:
+        record = {}
+        for k, v in item.items():
+            deserialized = deserializer.deserialize(v)
+            if deserialized is not None:
+                record[k] = deserialized
+        if record:
+            records.append(record)
+
+    if records:
+        return glueContext.spark_session.createDataFrame(records)
+    else:
+        empty_schema = StructType([StructField("listing_id", StringType(), True)])
+        return glueContext.spark_session.createDataFrame([], schema=empty_schema)
+
 # ---------- Helpers ----------
 def get_listing_ids_for_clients(
     glueContext,
@@ -62,56 +215,87 @@ def get_listing_ids_for_clients(
     source_region,
     client_ids,
 ):
-    """Get listing IDs for given client IDs by querying the METADATA segment in source listings table."""
+    """Get listing IDs for given client IDs by querying client-id-index (100x faster than scan)"""
     if not client_ids:
         return []
 
-    _log(logger, "[SEARCH_LOOKUP] Looking up listing IDs for client IDs: " + str(client_ids))
+    _log(logger, "[SEARCH_LOOKUP] Looking up listing IDs for client IDs using client-id-index: " + str(client_ids))
 
-    # Read only METADATA segment (client_id is in METADATA segment)
-    scan_filter = {
-        "dynamodb.filter.expression": "segment = :seg OR SK = :seg",
-        "dynamodb.filter.expressionAttributeValues": '{":seg":{"S":"SEGMENT#METADATA"}}'
-    }
-    dyf = read_ddb_table(glueContext, source_listings_table, source_region, scan_filter=scan_filter)
-    df = dyf.toDF()
+    try:
+        # OPTIMIZED: Use client-id-index to query by client_id
+        import boto3
+        from boto3.dynamodb.types import TypeDeserializer
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # Filter by client IDs
-    if "client_id" in df.columns and LISTING_ID_COL in df.columns:
-        df = df.filter(F.col("client_id").isin(client_ids))
+        ddb = boto3.client('dynamodb', region_name=source_region)
+        deserializer = TypeDeserializer()
 
-        # Log listing IDs per client for debugging
-        for client_id in client_ids:
-            client_df = df.filter(F.col("client_id") == client_id)
-            client_listings = (
-                client_df.select(LISTING_ID_COL).rdd.map(lambda r: r[0]).collect()
-            )
-            _log(logger,
-                "[SEARCH_LOOKUP] Client "
-                + str(client_id)
-                + " has "
-                + str(len(client_listings))
-                + " listings: "
-                + str(client_listings[:5])
-                + ("..." if len(client_listings) > 5 else "")
-            )
+        def query_client(client_id):
+            items = []
+            params = {
+                'TableName': source_listings_table,
+                'IndexName': 'client-id-index',
+                'KeyConditionExpression': 'client_id = :cid',
+                'FilterExpression': '#seg = :seg',
+                'ExpressionAttributeNames': {
+                    '#seg': 'segment'  # 'segment' is a reserved keyword
+                },
+                'ExpressionAttributeValues': {
+                    ':cid': {'S': str(client_id)},  # client_id is String, not Number
+                    ':seg': {'S': 'SEGMENT#METADATA'}
+                },
+                'ProjectionExpression': 'listing_id',
+                'Select': 'SPECIFIC_ATTRIBUTES'
+            }
 
-        # Get unique listing IDs across all clients
-        listing_ids = (
-            df.select(LISTING_ID_COL).distinct().rdd.map(lambda r: r[0]).collect()
-        )
+            while True:
+                response = ddb.query(**params)
+                items.extend(response.get('Items', []))
+                if 'LastEvaluatedKey' not in response:
+                    break
+                params['ExclusiveStartKey'] = response['LastEvaluatedKey']
 
-        _log(logger,
-            "[SEARCH_LOOKUP] Total: Found "
-            + str(len(listing_ids))
-            + " unique listing IDs across all clients"
-        )
+            return items
+
+        all_items = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(query_client, cid): cid for cid in client_ids}
+            for future in as_completed(futures):
+                all_items.extend(future.result())
+
+        _log(logger, f"[SEARCH_LOOKUP] Retrieved {len(all_items)} items from client-id-index")
+
+        # Extract listing IDs
+        listing_ids = set()
+        for item in all_items:
+            if 'listing_id' in item:
+                lid = deserializer.deserialize(item['listing_id'])
+                if lid:
+                    listing_ids.add(lid)
+
+        listing_ids = list(listing_ids)
+        _log(logger, f"[SEARCH_LOOKUP] Found {len(listing_ids)} unique listing IDs from client-id-index")
         return listing_ids
-    else:
-        _log(logger,
-            "[SEARCH_LOOKUP] Required columns not found in source METADATA segment (need client_id + listing_id)"
-        )
-        return []
+
+    except Exception as e:
+        _log(logger, f"[SEARCH_LOOKUP] Index query failed ({e}), falling back to table scan")
+
+        # FALLBACK: Use table scan if index query fails
+        scan_filter = {
+            "dynamodb.filter.expression": "segment = :seg OR SK = :seg",
+            "dynamodb.filter.expressionAttributeValues": '{":seg":{"S":"SEGMENT#METADATA"}}'
+        }
+        dyf = read_ddb_table(glueContext, source_listings_table, source_region, scan_filter=scan_filter)
+        df = dyf.toDF()
+
+        if "client_id" in df.columns and LISTING_ID_COL in df.columns:
+            df = df.filter(F.col("client_id").isin(client_ids))
+            listing_ids = df.select(LISTING_ID_COL).distinct().rdd.map(lambda r: r[0]).collect()
+            _log(logger, f"[SEARCH_LOOKUP] Found {len(listing_ids)} unique listing IDs from table scan")
+            return listing_ids
+        else:
+            _log(logger, "[SEARCH_LOOKUP] Required columns not found")
+            return []
 
 
 def prefixed_catalog_id(country_code_col, listing_id_col):
@@ -212,20 +396,27 @@ def _extract_state_type_as_json_only():
 
 def _extract_state_reasons_as_array():
     """
-    Extract reasons as JSON and parse to array<string>, or null if absent/not an array.
+    Extract reasons as JSON and parse to array<struct<ar:string, en:string>>, or null if absent/not an array.
     Accept both plain and AV-wrapped shapes.
     """
+    from pyspark.sql.types import StructType, StructField
     j = _json_of(STATE_DATA_COL)
     r1 = F.get_json_object(j, "$.reasons")
     r2 = F.get_json_object(j, "$.M.reasons")
     r_json = F.coalesce(r1, r2)
-    return F.when(r_json.isNull(), F.lit(None).cast("array<string>")) \
-            .otherwise(F.from_json(r_json, ArrayType(StringType())))
+    # Define reasons schema as array of structs with ar/en fields
+    reasons_schema = ArrayType(StructType([
+        StructField("ar", StringType(), True),
+        StructField("en", StringType(), True)
+    ]))
+    # Convert empty array string "[]" to null, otherwise parse as array of structs
+    return F.when(r_json.isNull() | (r_json == "[]"), F.lit(None).cast(reasons_schema)) \
+            .otherwise(F.from_json(r_json, reasons_schema))
 
 
 def map_state_type_expr(df):
     """
-    Rebuild data as struct<type:string, reasons:array<string>> and set top-level state_type.
+    Rebuild data as struct<type:string, reasons:array<struct<ar:string, en:string>>> and set top-level state_type.
     Uses JSON-based extraction first; if that yields null, falls back to existing top-level state_type.
     """
     if STATE_DATA_COL not in df.columns:
@@ -1154,7 +1345,19 @@ def _jget_multi_v2(paths, col: str = "data"):
     return F.coalesce(*[_jget_v2(p, col) for p in paths])
 
 def _group_first_non_null_v2(df, key_col, cols):
-    aggs = [F.first(c, ignorenulls=True).alias(c) for c in cols]
+    """
+    Group by key_col and aggregate columns.
+    For 'updated_at', use max to get the latest timestamp across all segments.
+    For other columns, use first non-null value.
+    """
+    aggs = []
+    for c in cols:
+        if c == "updated_at":
+            # Use max to get the latest updated_at across all segments
+            aggs.append(F.max(c).alias(c))
+        else:
+            # Use first non-null for other columns
+            aggs.append(F.first(c, ignorenulls=True).alias(c))
     return df.groupBy(key_col).agg(*aggs)
 
 def _amenities_both_shapes_v2(data_col="data"):
@@ -1195,8 +1398,15 @@ def map_state_type_expr_v2(df, state_col_name="data"):
         F.get_json_object(j, "$.reasons"),
         F.get_json_object(j, "$.M.reasons")
     )
-    reasons_arr = F.when(reasons_json.isNull(), F.lit(None).cast("array<string>")) \
-                   .otherwise(F.from_json(reasons_json, ArrayType(StringType())))
+    # Define reasons schema as array of structs with ar/en fields
+    from pyspark.sql.types import StructType, StructField
+    reasons_schema = ArrayType(StructType([
+        StructField("ar", StringType(), True),
+        StructField("en", StringType(), True)
+    ]))
+    # Convert empty array string "[]" to null, otherwise parse as array of structs
+    reasons_arr = F.when(reasons_json.isNull() | (reasons_json == "[]"), F.lit(None).cast(reasons_schema)) \
+                   .otherwise(F.from_json(reasons_json, reasons_schema))
 
     mapping_map = F.create_map(*sum([[F.lit(k), F.lit(v)] for k, v in STATE_TYPE_MAP.items()], []))
     mapped_type = F.coalesce(mapping_map.getItem(src_type), src_type).cast("string")
@@ -1270,83 +1480,81 @@ def _extract_attr_fields_v2(attr_df):
             print(f"[DEBUG] extract_numeric_value: Exception for {col_path}: {e}")
             return F.lit(None).cast("long")
 
-    # Check which optional fields exist
-    has_uae_emirate = has_nested_field(attr_df, "data.struct.uae_emirate")
-    has_owner_name = has_nested_field(attr_df, "data.struct.owner_name")
+    # Detect if data has 'struct' wrapper or fields are directly under 'data'
+    # After JSON parsing, the structure might be data.field instead of data.struct.field
+    has_struct_wrapper = has_nested_field(attr_df, "data.struct")
+    data_prefix = "data.struct" if has_struct_wrapper else "data"
+
+    print(f"[EXTRACT_ATTRIBUTES] data_prefix: {data_prefix}")
+    print(f"[EXTRACT_ATTRIBUTES] has owner_name: {has_nested_field(attr_df, f'{data_prefix}.owner_name')}")
+
+    # Helper to safely get field or return None
+    def safe_col(field_path, alias_name, cast_type="string"):
+        if has_nested_field(attr_df, field_path):
+            return F.col(field_path).alias(alias_name)
+        else:
+            return F.lit(None).cast(cast_type).alias(alias_name)
 
     select_cols = [
         LISTING_ID_COL,
-        F.col("data.struct.age").alias("age"),
-        F.col("data.struct.available_from").alias("availableFrom"),
+        safe_col(f"{data_prefix}.age", "age"),
+        safe_col(f"{data_prefix}.available_from", "availableFrom"),
 
         F.coalesce(
-            F.col("bathrooms"),
-            F.col("data.struct.bathrooms")
+            F.col("bathrooms") if "bathrooms" in attr_df.columns else F.lit(None),
+            F.col(f"{data_prefix}.bathrooms") if has_nested_field(attr_df, f"{data_prefix}.bathrooms") else F.lit(None)
         ).alias("bathrooms"),
 
         F.coalesce(
-            F.col("bedrooms"),
-            F.col("data.struct.bedrooms")
+            F.col("bedrooms") if "bedrooms" in attr_df.columns else F.lit(None),
+            F.col(f"{data_prefix}.bedrooms") if has_nested_field(attr_df, f"{data_prefix}.bedrooms") else F.lit(None)
         ).alias("bedrooms"),
 
         F.coalesce(
-            F.col("category"),
-            F.col("data.struct.category")
+            F.col("category") if "category" in attr_df.columns else F.lit(None),
+            F.col(f"{data_prefix}.category") if has_nested_field(attr_df, f"{data_prefix}.category") else F.lit(None)
         ).alias("category"),
 
-        F.col("data.struct.developer").alias("developer"),
-        F.col("data.struct.finishing_type").alias("finishingType"),
-        F.col("data.struct.floor_number").alias("floorNumber"),
-        F.col("data.struct.furnishing_type").alias("furnishingType"),
+        safe_col(f"{data_prefix}.developer", "developer"),
+        safe_col(f"{data_prefix}.finishing_type", "finishingType"),
+        safe_col(f"{data_prefix}.floor_number", "floorNumber"),
+        safe_col(f"{data_prefix}.furnishing_type", "furnishingType"),
 
         # Boolean fields
-        F.col("data.struct.has_garden").alias("hasGarden"),
-        F.col("data.struct.has_kitchen").alias("hasKitchen"),
-        F.col("data.struct.has_parking_on_site").alias("hasParkingOnSite"),
+        safe_col(f"{data_prefix}.has_garden", "hasGarden", "boolean"),
+        safe_col(f"{data_prefix}.has_kitchen", "hasKitchen", "boolean"),
+        safe_col(f"{data_prefix}.has_parking_on_site", "hasParkingOnSite", "boolean"),
 
         # Land/plot fields
-        F.col("data.struct.land_number").alias("landNumber"),
-        F.col("data.struct.number_of_floors").alias("numberOfFloors"),
-        F.col("data.struct.plot_number").alias("plotNumber"),
-        F.col("data.struct.plot_size").alias("plotSize"),
+        safe_col(f"{data_prefix}.land_number", "landNumber"),
+        safe_col(f"{data_prefix}.number_of_floors", "numberOfFloors"),
+        safe_col(f"{data_prefix}.plot_number", "plotNumber"),
+        safe_col(f"{data_prefix}.plot_size", "plotSize"),
 
-        F.col("data.struct.parking_slots").alias("parkingSlots"),
-        F.col("data.struct.project_status").alias("projectStatus"),
+        safe_col(f"{data_prefix}.parking_slots", "parkingSlots"),
+        safe_col(f"{data_prefix}.project_status", "projectStatus"),
         # Size field - extract as-is, will unwrap later if needed
-        F.col("data.struct.size").alias("size_raw"),
-        # Transform street field - extract width as simple number and direction as string
-        # Source has Width/Direction (capital), output should be width/direction (lowercase)
-        F.when(
-            F.col("data.struct.street").isNotNull(),
-            F.struct(
-                # Extract width - handle {long: N}, {double: N}, or plain N
-                # Cast to int, will be null if extract_numeric_value returns null
-                extract_numeric_value("data.struct.street.Width").cast("int").alias("width"),
-                # Direction to lowercase
-                F.lower(F.col("data.struct.street.Direction")).alias("direction")
-            )
-        ).alias("street"),
+        safe_col(f"{data_prefix}.size", "size_raw"),
+        # Transform street field - extract width as simple number (street) and direction as separate field
+        # Source has street.Width.long and street.Direction, output should be street (number) and direction (string)
+        (extract_numeric_value(f"{data_prefix}.street.Width").cast("int")
+         if has_nested_field(attr_df, f"{data_prefix}.street.Width")
+         else F.lit(None).cast("int")).alias("street"),
+        # Direction as separate field
+        (F.col(f"{data_prefix}.street.Direction")
+         if has_nested_field(attr_df, f"{data_prefix}.street.Direction")
+         else F.lit(None)).alias("direction"),
         F.coalesce(
-            F.col("type"),
-            F.col("data.struct.type")
+            F.col("type") if "type" in attr_df.columns else F.lit(None),
+            F.col(f"{data_prefix}.type") if has_nested_field(attr_df, f"{data_prefix}.type") else F.lit(None)
         ).alias("type"),
 
-        F.col("data.struct.unit_number").alias("unitNumber"),
-        F.col("data.struct.title.en").alias("title_en"),
-        F.col("data.struct.title.ar").alias("title_ar")
+        safe_col(f"{data_prefix}.unit_number", "unitNumber"),
+        safe_col(f"{data_prefix}.title.en", "title_en") if has_nested_field(attr_df, f"{data_prefix}.title") else F.lit(None).alias("title_en"),
+        safe_col(f"{data_prefix}.title.ar", "title_ar") if has_nested_field(attr_df, f"{data_prefix}.title") else F.lit(None).alias("title_ar"),
+        safe_col(f"{data_prefix}.owner_name", "ownerName"),
+        safe_col(f"{data_prefix}.uae_emirate", "uaeEmirate")
     ]
-
-    # Add owner_name only if it exists in the schema
-    if has_owner_name:
-        select_cols.append(F.col("data.struct.owner_name").alias("ownerName"))
-    else:
-        select_cols.append(F.lit(None).cast("string").alias("ownerName"))
-
-    # Add uae_emirate only if it exists in the schema
-    if has_uae_emirate:
-        select_cols.append(F.col("data.struct.uae_emirate").alias("uaeEmirate"))
-    else:
-        select_cols.append(F.lit(None).cast("string").alias("uaeEmirate"))
 
     # First select all columns
     result_df = attr_df.select(*select_cols)
@@ -1360,19 +1568,29 @@ def _extract_attr_fields_v2(attr_df):
 
     # Build the appropriate expression based on the schema
     if isinstance(size_raw_type, StructType):
-        # It's a struct, unwrap it
+        # It's a struct, unwrap it and cast to double
         print("[DEBUG] Unwrapping size as struct")
         size_expr = F.coalesce(
             F.col("size_raw.double"),
             F.col("size_raw.long").cast("double")
         )
     else:
-        # It's already a primitive, use it directly
-        print("[DEBUG] Using size as primitive")
-        size_expr = F.col("size_raw")
+        # It's already a primitive, cast to double for consistency
+        print("[DEBUG] Using size as primitive, casting to double")
+        size_expr = F.col("size_raw").cast("double")
 
     # Apply the transformation
     result_df = result_df.withColumn("size", size_expr).drop("size_raw")
+
+    # Debug: Check if ownerName is populated
+    sample_owner = result_df.select(LISTING_ID_COL, "ownerName").limit(3).collect()
+    for row in sample_owner:
+        print(f"[EXTRACT_ATTRIBUTES] listing_id={row[LISTING_ID_COL]}, ownerName={row['ownerName']}")
+
+    # Debug: Check street and direction extraction
+    sample_street = result_df.select(LISTING_ID_COL, "street", "direction").limit(3).collect()
+    for row in sample_street:
+        print(f"[EXTRACT_ATTRIBUTES] listing_id={row[LISTING_ID_COL]}, street={row['street']}, direction={row['direction']}")
 
     return result_df
 
@@ -1391,49 +1609,131 @@ def _extract_price_fields_v2(price_df):
     """Extract price segment fields"""
     from pyspark.sql import functions as F
 
+    # Helper function to safely check if a nested field exists
+    def has_nested_field(df, field_path):
+        try:
+            df.select(field_path).first()
+            return True
+        except:
+            return False
+
+    # Detect if data has 'struct' wrapper or fields are directly under 'data'
+    has_struct_wrapper = has_nested_field(price_df, "data.struct")
+    data_prefix = "data.struct" if has_struct_wrapper else "data"
+
+    # Check if data is a MapType (from DynamoDB) or StructType
+    from pyspark.sql.types import MapType
+    data_type = price_df.schema["data"].dataType if "data" in price_df.columns else None
+    is_map_type = isinstance(data_type, MapType)
+
+    # Debug: Log data type and sample
+    print(f"[EXTRACT_PRICE] data_type: {data_type}, is_map_type: {is_map_type}, data_prefix: {data_prefix}")
+    print(f"[EXTRACT_PRICE] Full schema: {price_df.schema}")
+    sample_data = price_df.select("listing_id", "data").limit(2).collect()
+    for row in sample_data:
+        print(f"[EXTRACT_PRICE] Sample - listing_id: {row['listing_id']}, data: {row['data']}")
+        if row['data']:
+            print(f"[EXTRACT_PRICE] data type: {type(row['data'])}, data dict: {row['data'].asDict() if hasattr(row['data'], 'asDict') else row['data']}")
+
+    # Helper to safely get field or return None
+    def safe_col(field_path, alias_name, cast_type="string"):
+        if is_map_type and field_path.startswith(data_prefix + "."):
+            # For MapType, use getItem instead of dot notation
+            field_name = field_path.replace(data_prefix + ".", "")
+            return F.col("data").getItem(field_name).cast(cast_type).alias(alias_name)
+        elif has_nested_field(price_df, field_path):
+            return F.col(field_path).alias(alias_name)
+        else:
+            return F.lit(None).cast(cast_type).alias(alias_name)
+
     return price_df.select(
         LISTING_ID_COL,
 
-        # Price type
+        # Price type - handle both MapType and StructType
         F.coalesce(
             F.col("price_type") if "price_type" in price_df.columns else F.lit(None),
-            F.col("data.struct.type")
+            F.col("data").getItem("type") if is_map_type else (F.col(f"{data_prefix}.type") if has_nested_field(price_df, f"{data_prefix}.type") else F.lit(None))
         ).alias("price_type"),
 
-        # amounts.sale - already BIGINT, just cast to string
-        F.when(
-            F.col("data.struct.amounts.sale").isNotNull(),
-            F.col("data.struct.amounts.sale").cast("string")
-        ).alias("price_amount_sell"),
+        # amounts.sale/sell - handle both MapType and StructType, and both field names (sale/sell)
+        # Source uses "sale", destination uses "sell"
+        (F.coalesce(
+            F.when(
+                F.col("data").getItem("amounts").getItem("sale").isNotNull(),
+                F.col("data").getItem("amounts").getItem("sale").cast("string")
+            ) if is_map_type else (
+                F.when(
+                    F.col(f"{data_prefix}.amounts.sale").isNotNull(),
+                    F.col(f"{data_prefix}.amounts.sale").cast("string")
+                ) if has_nested_field(price_df, f"{data_prefix}.amounts.sale") else F.lit(None)
+            ),
+            F.when(
+                F.col("data").getItem("amounts").getItem("sell").isNotNull(),
+                F.col("data").getItem("amounts").getItem("sell").cast("string")
+            ) if is_map_type else (
+                F.when(
+                    F.col(f"{data_prefix}.amounts.sell").isNotNull(),
+                    F.col(f"{data_prefix}.amounts.sell").cast("string")
+                ) if has_nested_field(price_df, f"{data_prefix}.amounts.sell") else F.lit(None)
+            )
+        )).alias("price_amount_sell"),
 
-        # amounts.monthly - already BIGINT, just cast to string
-        F.when(
-            F.col("data.struct.amounts.monthly").isNotNull(),
-            F.col("data.struct.amounts.monthly").cast("string")
-        ).alias("price_amount_monthly"),
+        # amounts.monthly - handle both MapType and StructType
+        (F.when(
+            F.col("data").getItem("amounts").getItem("monthly").isNotNull(),
+            F.col("data").getItem("amounts").getItem("monthly").cast("string")
+        ) if is_map_type else (
+            F.when(
+                F.col(f"{data_prefix}.amounts.monthly").isNotNull(),
+                F.col(f"{data_prefix}.amounts.monthly").cast("string")
+            ) if has_nested_field(price_df, f"{data_prefix}.amounts.monthly") else F.lit(None)
+        )).alias("price_amount_monthly"),
 
-        # amounts.yearly - added for yearly rental prices
-        F.when(
-            F.col("data.struct.amounts.yearly").isNotNull(),
-            F.col("data.struct.amounts.yearly").cast("string")
-        ).alias("price_amount_yearly"),
+        # amounts.yearly - handle both MapType and StructType
+        (F.when(
+            F.col("data").getItem("amounts").getItem("yearly").isNotNull(),
+            F.col("data").getItem("amounts").getItem("yearly").cast("string")
+        ) if is_map_type else (
+            F.when(
+                F.col(f"{data_prefix}.amounts.yearly").isNotNull(),
+                F.col(f"{data_prefix}.amounts.yearly").cast("string")
+            ) if has_nested_field(price_df, f"{data_prefix}.amounts.yearly") else F.lit(None)
+        )).alias("price_amount_yearly"),
 
         # Downpayment - already BIGINT
-        F.col("data.struct.downpayment").alias("price_downpayment"),
+        safe_col(f"{data_prefix}.downpayment", "price_downpayment", "long"),
 
         # Number of mortgage years - already BIGINT
-        F.col("data.struct.number_of_mortgage_years").alias("price_number_years"),
+        safe_col(f"{data_prefix}.number_of_mortgage_years", "price_number_years", "long"),
 
-        # Payment methods - data.array for DynamoDB List type
-        F.when(
-            F.col("data.array").isNotNull() & (F.size(F.col("data.array")) > 0),
-            F.to_json(F.col("data.array"))
-        ).otherwise(
-            F.when(
-                F.col("data.struct.payment_methods").isNotNull() & (F.size(F.col("data.struct.payment_methods")) > 0),
-                F.to_json(F.col("data.struct.payment_methods"))
-            )
-        ).alias("price_payment_methods_json"),
+        # Number of cheques - INT
+        safe_col(f"{data_prefix}.number_of_cheques", "price_number_of_cheques", "int"),
+
+        # Payment methods - already stringified during DataFrame creation
+        # Just extract it if it exists
+        safe_col(f"{data_prefix}.payment_methods", "price_payment_methods_json"),
+
+        # Utilities inclusive - BOOLEAN
+        safe_col(f"{data_prefix}.utilities_inclusive", "price_utilities_inclusive", "boolean"),
+
+        # On request - BOOLEAN
+        safe_col(f"{data_prefix}.on_request", "price_on_request", "boolean"),
+
+        # FilterAmount - DECIMAL/NUMBER (used for filtering)
+        safe_col(f"{data_prefix}.FilterAmount", "price_filter_amount", "decimal(20,2)"),
+
+        # SortAmount - DECIMAL/NUMBER (used for sorting)
+        safe_col(f"{data_prefix}.SortAmount", "price_sort_amount", "decimal(20,2)"),
+
+        # Obligation - struct with comment and enabled (optional field, only in some countries like SA)
+        # Skip this field for now - will be added later if it exists
+        F.lit(None).cast("struct<comment:string,enabled:boolean>").alias("price_obligation"),
+
+        # Mortgage - struct with comment and enabled (optional field)
+        F.lit(None).cast("struct<comment:string,enabled:boolean>").alias("price_mortgage"),
+
+        # Value affected - struct with comment and enabled (optional field)
+        F.lit(None).cast("struct<comment:string,enabled:boolean>").alias("price_value_affected"),
     )
 
 
@@ -1441,13 +1741,40 @@ def _extract_amenities_fields_v2(amen_df):
     """Extract amenities segment fields"""
     from pyspark.sql import functions as F
 
-    # DynamoDB List (data.L) becomes data.array in Spark
+    # Helper function to safely check if a nested field exists
+    def has_nested_field(df, field_path):
+        try:
+            df.select(field_path).first()
+            return True
+        except:
+            return False
+
+    # After JSON parsing, data is directly an array (not data.array)
+    # Check if data is an array or if we need to access data.array
+    if has_nested_field(amen_df, "data.array"):
+        # Old structure: data.array
+        data_col = "data.array"
+    else:
+        # New structure after JSON parsing: data is directly the array
+        data_col = "data"
+
+    # Log data field type for debugging
+    from pyspark.sql.types import ArrayType, StringType
+    if "data" in amen_df.columns:
+        data_type = amen_df.schema["data"].dataType
+        print(f"[EXTRACT_AMENITIES] data field type = {data_type}, using column: {data_col}")
+
+        # Sample a few records
+        sample_data = amen_df.select(LISTING_ID_COL, "data").limit(3).collect()
+        for row in sample_data:
+            print(f"[EXTRACT_AMENITIES] Sample listing_id={row[LISTING_ID_COL]}, data type={type(row['data'])}, data={row['data']}")
+
     return amen_df.select(
         LISTING_ID_COL,
-        F.when(
-            F.col("data.array").isNotNull() & (F.size(F.col("data.array")) > 0),
-            F.col("data.array")
-        ).alias("amenities_arr")
+        (F.when(
+            F.col(data_col).isNotNull() & (F.size(F.col(data_col)) > 0),
+            F.col(data_col)
+        ) if has_nested_field(amen_df, data_col) else F.lit(None)).alias("amenities_arr")
     )
 
 
@@ -1455,8 +1782,21 @@ def _extract_metadata_fields_v2(meta_df):
     """Extract metadata segment fields"""
     from pyspark.sql import functions as F
 
-    # Check if web_ids column exists
+    # Check which optional columns exist
     has_web_ids = "web_ids" in meta_df.columns
+    has_published_at = "published_at" in meta_df.columns
+    has_first_published_at = "first_published_at" in meta_df.columns
+    has_reference = "reference" in meta_df.columns
+
+    print(f"[EXTRACT_METADATA] Columns in meta_df: {meta_df.columns}")
+    print(f"[EXTRACT_METADATA] has_published_at: {has_published_at}")
+    print(f"[EXTRACT_METADATA] has_first_published_at: {has_first_published_at}")
+
+    # Sample to check values
+    if has_published_at:
+        sample = meta_df.select(LISTING_ID_COL, "published_at").limit(3).collect()
+        for row in sample:
+            print(f"[EXTRACT_METADATA] listing_id={row[LISTING_ID_COL]}, published_at={row['published_at']}")
 
     select_cols = [
         LISTING_ID_COL,
@@ -1466,9 +1806,27 @@ def _extract_metadata_fields_v2(meta_df):
         F.col("assigned_to_id").alias("meta_assigned_to_id"),
         F.col("broker_id").alias("meta_broker_id"),
         F.col("location_id").alias("meta_location_id"),
-        F.col("published_at").alias("meta_published_at"),
-        F.col("first_published_at").alias("meta_first_published_at")
+        F.col("created_by_id").alias("meta_created_by_id"),
+        F.col("updated_by_id").alias("meta_updated_by_id")
     ]
+
+    # Add first_published_at only if it exists (optional field, not all records have it)
+    if has_first_published_at:
+        select_cols.append(F.col("first_published_at").alias("meta_first_published_at"))
+    else:
+        select_cols.append(F.lit(None).cast("string").alias("meta_first_published_at"))
+
+    # Add published_at only if it exists (optional field, not all records have it)
+    if has_published_at:
+        select_cols.append(F.col("published_at").alias("meta_published_at"))
+    else:
+        select_cols.append(F.lit(None).cast("string").alias("meta_published_at"))
+
+    # Add reference only if it exists (optional field)
+    if has_reference:
+        select_cols.append(F.col("reference").alias("meta_reference"))
+    else:
+        select_cols.append(F.lit(None).cast("string").alias("meta_reference"))
 
     # Add web_ids only if it exists in the schema
     if has_web_ids:
@@ -1482,6 +1840,19 @@ def _extract_metadata_fields_v2(meta_df):
 def _extract_state_fields_v2(state_df, state_col_name="data"):
     """Extract and normalize state segment fields"""
     from pyspark.sql import functions as F
+    from pyspark.sql.types import ArrayType, StringType
+
+    # Helper function to safely check if a nested field exists
+    def has_nested_field(df, field_path):
+        try:
+            df.select(field_path).first()
+            return True
+        except:
+            return False
+
+    # Detect if data has 'struct' wrapper or fields are directly under 'data'
+    has_struct_wrapper = has_nested_field(state_df, "data.struct")
+    data_prefix = "data.struct" if has_struct_wrapper else "data"
 
     # Draft states list (after mapping has been applied)
     draft_states = [
@@ -1497,6 +1868,60 @@ def _extract_state_fields_v2(state_df, state_col_name="data"):
         "takendown_pending_approval"
     ]
 
+    # Determine how to extract reasons based on field type
+    reasons_expr = F.lit(None).alias("state_reasons")
+    if has_nested_field(state_df, f"{data_prefix}.reasons"):
+        # Check if reasons is a string or array
+        try:
+            field_type = None
+            for field in state_df.schema.fields:
+                if field.name == "data":
+                    if hasattr(field.dataType, 'fields'):
+                        for nested in field.dataType.fields:
+                            if nested.name == "reasons":
+                                field_type = nested.dataType
+                            elif nested.name == "struct" and hasattr(nested.dataType, 'fields'):
+                                for inner in nested.dataType.fields:
+                                    if inner.name == "reasons":
+                                        field_type = inner.dataType
+
+            if isinstance(field_type, StringType):
+                # String type: check for empty array string "[]"
+                # Parse as array of structs with ar/en fields
+                from pyspark.sql.types import StructType, StructField
+                reasons_schema = ArrayType(StructType([
+                    StructField("ar", StringType(), True),
+                    StructField("en", StringType(), True)
+                ]))
+                reasons_expr = (F.when(F.col(f"{data_prefix}.reasons") == "[]", F.lit(None).cast(reasons_schema))
+                                 .when(F.col(f"{data_prefix}.reasons").isNull(), F.lit(None).cast(reasons_schema))
+                                 .otherwise(F.from_json(F.col(f"{data_prefix}.reasons"), reasons_schema))
+                                 .alias("state_reasons"))
+            elif isinstance(field_type, ArrayType):
+                # Array type: check if it's array<string> that needs parsing or already array<struct>
+                from pyspark.sql.types import StructType, StructField
+                if isinstance(field_type.elementType, StringType):
+                    # Array of strings - need to parse each element as JSON
+                    reasons_schema = StructType([
+                        StructField("ar", StringType(), True),
+                        StructField("en", StringType(), True)
+                    ])
+                    reasons_expr = (F.when(F.size(F.col(f"{data_prefix}.reasons")) == 0, F.lit(None).cast(ArrayType(reasons_schema)))
+                                     .otherwise(F.transform(F.col(f"{data_prefix}.reasons"),
+                                                           lambda x: F.from_json(x, reasons_schema)))
+                                     .alias("state_reasons"))
+                else:
+                    # Already array<struct>, just check for empty
+                    reasons_expr = (F.when(F.size(F.col(f"{data_prefix}.reasons")) == 0, F.lit(None).cast(field_type))
+                                     .otherwise(F.col(f"{data_prefix}.reasons"))
+                                     .alias("state_reasons"))
+            else:
+                # Unknown type, just extract as-is
+                reasons_expr = F.col(f"{data_prefix}.reasons").alias("state_reasons")
+        except:
+            # Fallback: just extract the field
+            reasons_expr = F.col(f"{data_prefix}.reasons").alias("state_reasons")
+
     return state_df.select(
         LISTING_ID_COL,
         # Use the top-level state_type column directly
@@ -1509,8 +1934,8 @@ def _extract_state_fields_v2(state_df, state_col_name="data"):
              .when(F.col("state_type").startswith("archived"), F.lit("archived"))
              .otherwise(F.col("state_type"))
         ).alias("state_stage"),
-        # Extract reasons array from data.struct
-        F.col("data.struct.reasons").alias("state_reasons")
+        # Extract reasons with appropriate handling based on type
+        reasons_expr
     )
 
 
@@ -1532,6 +1957,7 @@ def read_ddb_for_test_listing(table_name, region, listing_id, glueContext, strin
     table = dynamodb.Table(table_name)
 
     # Query the table - resource API returns deserialized data
+    print(f"[QUERY] Querying DynamoDB for listing_id={listing_id}")
     try:
         response = table.query(
             KeyConditionExpression='listing_id = :lid',
@@ -1539,21 +1965,28 @@ def read_ddb_for_test_listing(table_name, region, listing_id, glueContext, strin
         )
 
         items = response['Items']
+        print(f"[QUERY] Retrieved {len(items)} items in first page")
 
         # Handle pagination
+        page_count = 1
         while 'LastEvaluatedKey' in response:
+            page_count += 1
             response = table.query(
                 KeyConditionExpression='listing_id = :lid',
                 ExpressionAttributeValues={':lid': listing_id},
                 ExclusiveStartKey=response['LastEvaluatedKey']
             )
             items.extend(response['Items'])
+            print(f"[QUERY] Retrieved {len(response['Items'])} items in page {page_count}")
+
+        print(f"[QUERY] Total items retrieved: {len(items)} across {page_count} page(s)")
     except AttributeError as e:
         print(f"[ERROR] boto3 query failed for listing_id={listing_id}: {e}")
         print(f"[ERROR] This usually means malformed data in DynamoDB")
         raise
 
     if not items:
+        print(f"[QUERY] No items found for listing_id={listing_id}, returning empty DataFrame")
         # Return empty DataFrame
         spark = glueContext.spark_session
         from pyspark.sql.types import StructType, StructField, StringType
@@ -1570,15 +2003,28 @@ def read_ddb_for_test_listing(table_name, region, listing_id, glueContext, strin
         elif isinstance(obj, list):
             return [convert_decimals(item) for item in obj]
         elif isinstance(obj, dict):
-            return {k: convert_decimals(v) for k, v in obj.items()}
+            result = {}
+            for k, v in obj.items():
+                converted = convert_decimals(v)
+                # Keep the key even if value is None
+                result[k] = converted
+            return result
         elif isinstance(obj, Decimal):
             return int(obj) if obj % 1 == 0 else float(obj)
         else:
             return obj
 
     # Deserialize and convert
+    print(f"[CONVERT] Converting {len(items)} items (Decimals -> float/int)")
     try:
         clean_items = [convert_decimals(item) for item in items]
+        print(f"[CONVERT] Successfully converted {len(clean_items)} items")
+
+        # Log sample item structure for debugging
+        if clean_items:
+            sample = clean_items[0]
+            print(f"[CONVERT] Sample item keys: {list(sample.keys()) if isinstance(sample, dict) else 'NOT A DICT'}")
+            print(f"[CONVERT] Sample item type: {type(sample)}")
     except AttributeError as e:
         print(f"[ERROR] convert_decimals failed: {e}")
         print(f"[ERROR] Items causing issue: {items[:5]}")  # Print first 5 items for debugging
@@ -1586,21 +2032,126 @@ def read_ddb_for_test_listing(table_name, region, listing_id, glueContext, strin
 
     # Stringify complex fields if requested (avoids CANNOT_MERGE_TYPE)
     if stringify_complex:
-        for it in clean_items:
-            # `data` is the problematic field (Array vs Map across segments)
-            v = it.get("data")
-            if v is not None and not isinstance(v, (str, int, float, bool)):
-                try:
-                    it["data"] = json.dumps(v)
-                except (TypeError, AttributeError) as e:
-                    print(f"[WARN] Failed to stringify data field: {e}")
-                    it["data"] = None
+        print(f"[STRINGIFY] Stringifying complex fields for {len(clean_items)} items")
+        stringified_count = 0
+        valid_items = []
+
+        # Helper to convert Binary to base64 string
+        import base64
+        def convert_binary_to_base64(obj):
+            if isinstance(obj, bytes):
+                return base64.b64encode(obj).decode('utf-8')
+            elif isinstance(obj, dict):
+                return {k: convert_binary_to_base64(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_binary_to_base64(item) for item in obj]
+            else:
+                return obj
+
+        for idx, it in enumerate(clean_items):
+            # Safety check: ensure it is a dict
+            if it is None:
+                print(f"[WARN] Item {idx} is None, removing from list")
+                continue
+            if not isinstance(it, dict):
+                print(f"[WARN] Item {idx} is not a dict: {type(it)}, removing from list")
+                continue
+            # Stringify ALL complex fields (including 'data') to avoid schema conflicts during DataFrame creation
+            # We'll parse 'data' back to struct after DataFrame is created and filtered by segment
+            for key, value in list(it.items()):
+                if value is not None and not isinstance(value, (str, int, float, bool)):
+                    try:
+                        # Convert Binary to base64 before JSON serialization
+                        value_converted = convert_binary_to_base64(value)
+                        it[key] = json.dumps(value_converted)
+                        stringified_count += 1
+                    except (TypeError, AttributeError) as e:
+#                         print(f"[WARN] Failed to stringify {key} field for item {idx}: {e}")
+                        it[key] = None
+            valid_items.append(it)
+
+        clean_items = valid_items
+        print(f"[STRINGIFY] Stringified {stringified_count} data fields, kept {len(clean_items)} valid items")
+
+    # Recursive function to remove None values from nested structures
+    def remove_none_recursive(obj):
+        if obj is None:
+            return None
+        elif isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                cleaned_v = remove_none_recursive(v)
+                if cleaned_v is not None:
+                    result[k] = cleaned_v
+            return result  # Return dict/list even if empty
+        elif isinstance(obj, list):
+            result = []
+            for item in obj:
+                cleaned_item = remove_none_recursive(item)
+                if cleaned_item is not None:
+                    result.append(cleaned_item)
+            return result  # Return dict/list even if empty
+        else:
+            return obj
 
     # Create DataFrame
+    print(f"[DATAFRAME] Creating Spark DataFrame from {len(clean_items)} items")
+    # Log segments for debugging
+    segments = set()
+    for item in clean_items[:10]:  # Check first 10 items
+        if isinstance(item, dict) and 'segment' in item:
+            segments.add(item.get('segment'))
+    print(f"[DATAFRAME] Sample segments: {segments}")
     spark = glueContext.spark_session
-    df = spark.createDataFrame(clean_items)
 
-    return df
+    if not clean_items:
+        print(f"[DATAFRAME] No valid items, returning empty DataFrame")
+        from pyspark.sql.types import StructType, StructField, StringType
+        empty_schema = StructType([
+            StructField("listing_id", StringType(), True),
+            StructField("segment", StringType(), True)
+        ])
+        return spark.createDataFrame([], schema=empty_schema)
+
+    # Final safety check: remove any items that are None or not dict, and recursively remove None values
+    final_items = []
+    for item in clean_items:
+        if item is None or not isinstance(item, dict):
+            continue
+        # Recursively remove None values from within the dict (Spark can't handle None in nested structures)
+        cleaned_item = remove_none_recursive(item)
+        if cleaned_item:  # Only add if there are any non-None values
+            final_items.append(cleaned_item)
+
+    if len(final_items) < len(clean_items):
+        print(f"[DATAFRAME] Filtered out {len(clean_items) - len(final_items)} invalid items")
+
+    if not final_items:
+        print(f"[DATAFRAME] No valid items after filtering, returning empty DataFrame")
+        from pyspark.sql.types import StructType, StructField, StringType
+        empty_schema = StructType([
+            StructField("listing_id", StringType(), True),
+            StructField("segment", StringType(), True)
+        ])
+        return spark.createDataFrame([], schema=empty_schema)
+
+    try:
+        df = spark.createDataFrame(final_items)
+        print(f"[DATAFRAME] Created DataFrame with {df.count()} rows and {len(df.columns)} columns")
+        print(f"[DATAFRAME] Columns: {df.columns}")
+        return df
+    except Exception as e:
+        print(f"[ERROR] Failed to create DataFrame: {e}")
+        print(f"[ERROR] Sample of items causing issue:")
+        for i, item in enumerate(final_items[:3]):
+            print(f"[ERROR] Item {i}: {type(item)}, keys: {list(item.keys()) if isinstance(item, dict) else 'NOT A DICT'}")
+            if isinstance(item, dict):
+                for k, v in list(item.items())[:5]:
+                    print(f"[ERROR]   {k}: {type(v)}")
+                    # If it's a dict, show its contents
+                    if isinstance(v, dict):
+                        print(f"[ERROR]     Contents: {v}")
+        raise
 
 
 def read_ddb_for_test_listings(table_name, region, listing_ids, glueContext, stringify_complex=False):
@@ -1621,14 +2172,21 @@ def read_ddb_for_test_listings(table_name, region, listing_ids, glueContext, str
 
     all_items = []
 
-    # Query each listing individually (DynamoDB doesn't support multi-partition queries)
-    try:
-        for listing_id in listing_ids:
+    # Use parallel queries to retrieve all segments for each listing (faster than sequential)
+    print(f"[QUERY_PARALLEL] Retrieving all segments for {len(listing_ids)} listing(s) using parallel queries")
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time
+
+    def query_listing(listing_id):
+        """Query all segments for a single listing"""
+        items = []
+        try:
             response = table.query(
                 KeyConditionExpression='listing_id = :lid',
                 ExpressionAttributeValues={':lid': listing_id}
             )
-            all_items.extend(response['Items'])
+            items.extend(response['Items'])
 
             # Handle pagination
             while 'LastEvaluatedKey' in response:
@@ -1637,13 +2195,37 @@ def read_ddb_for_test_listings(table_name, region, listing_ids, glueContext, str
                     ExpressionAttributeValues={':lid': listing_id},
                     ExclusiveStartKey=response['LastEvaluatedKey']
                 )
-                all_items.extend(response['Items'])
-    except AttributeError as e:
-        print(f"[ERROR] boto3 query failed for listing_ids={listing_ids}: {e}")
-        print(f"[ERROR] This usually means malformed data in DynamoDB")
+                items.extend(response['Items'])
+
+            return listing_id, items, None
+        except Exception as e:
+            return listing_id, [], str(e)
+
+    try:
+        # Use ThreadPoolExecutor for parallel queries (10 workers)
+        max_workers = min(10, len(listing_ids))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(query_listing, lid): lid for lid in listing_ids}
+
+            completed = 0
+            for future in as_completed(futures):
+                listing_id, items, error = future.result()
+                completed += 1
+
+                if error:
+                    print(f"[QUERY_PARALLEL] Error querying listing: {error}")
+                else:
+                    all_items.extend(items)
+                    if completed % 100 == 0 or completed == len(listing_ids):
+                        print(f"[QUERY_PARALLEL] Progress: {completed}/{len(listing_ids)} listings, {len(all_items)} items retrieved")
+
+        print(f"[QUERY_PARALLEL] Total items retrieved: {len(all_items)} for {len(listing_ids)} listing(s)")
+    except Exception as e:
+        print(f"[ERROR] Parallel query failed: {e}")
         raise
 
     if not all_items:
+        print(f"[QUERY_MULTI] No items found for any listing, returning empty DataFrame")
         # Return empty DataFrame
         spark = glueContext.spark_session
         from pyspark.sql.types import StructType, StructField, StringType
@@ -1660,14 +2242,27 @@ def read_ddb_for_test_listings(table_name, region, listing_ids, glueContext, str
         elif isinstance(obj, list):
             return [convert_decimals(item) for item in obj]
         elif isinstance(obj, dict):
-            return {k: convert_decimals(v) for k, v in obj.items()}
+            result = {}
+            for k, v in obj.items():
+                converted = convert_decimals(v)
+                # Keep the key even if value is None
+                result[k] = converted
+            return result
         elif isinstance(obj, Decimal):
             return int(obj) if obj % 1 == 0 else float(obj)
         else:
             return obj
 
+    print(f"[CONVERT_MULTI] Converting {len(all_items)} items (Decimals -> float/int)")
     try:
         clean_items = [convert_decimals(item) for item in all_items]
+        print(f"[CONVERT_MULTI] Successfully converted {len(clean_items)} items")
+
+        # Log sample item structure for debugging
+        if clean_items:
+            sample = clean_items[0]
+            print(f"[CONVERT_MULTI] Sample item keys: {list(sample.keys()) if isinstance(sample, dict) else 'NOT A DICT'}")
+            print(f"[CONVERT_MULTI] Sample item type: {type(sample)}")
     except AttributeError as e:
         print(f"[ERROR] convert_decimals failed: {e}")
         print(f"[ERROR] Items causing issue: {all_items[:5]}")  # Print first 5 items for debugging
@@ -1675,21 +2270,126 @@ def read_ddb_for_test_listings(table_name, region, listing_ids, glueContext, str
 
     # Stringify complex fields if requested (avoids CANNOT_MERGE_TYPE)
     if stringify_complex:
-        for it in clean_items:
-            # `data` is the problematic field (Array vs Map across segments)
-            v = it.get("data")
-            if v is not None and not isinstance(v, (str, int, float, bool)):
-                try:
-                    it["data"] = json.dumps(v)
-                except (TypeError, AttributeError) as e:
-                    print(f"[WARN] Failed to stringify data field: {e}")
-                    it["data"] = None
+        print(f"[STRINGIFY_MULTI] Stringifying complex fields for {len(clean_items)} items")
+        stringified_count = 0
+        valid_items = []
+
+        # Helper to convert Binary to base64 string
+        import base64
+        def convert_binary_to_base64(obj):
+            if isinstance(obj, bytes):
+                return base64.b64encode(obj).decode('utf-8')
+            elif isinstance(obj, dict):
+                return {k: convert_binary_to_base64(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_binary_to_base64(item) for item in obj]
+            else:
+                return obj
+
+        for idx, it in enumerate(clean_items):
+            # Safety check: ensure it is a dict
+            if it is None:
+                print(f"[WARN] Item {idx} is None, removing from list")
+                continue
+            if not isinstance(it, dict):
+                print(f"[WARN] Item {idx} is not a dict: {type(it)}, removing from list")
+                continue
+            # Stringify ALL complex fields (including 'data') to avoid schema conflicts during DataFrame creation
+            # We'll parse 'data' back to struct after DataFrame is created and filtered by segment
+            for key, value in list(it.items()):
+                if value is not None and not isinstance(value, (str, int, float, bool)):
+                    try:
+                        # Convert Binary to base64 before JSON serialization
+                        value_converted = convert_binary_to_base64(value)
+                        it[key] = json.dumps(value_converted)
+                        stringified_count += 1
+                    except (TypeError, AttributeError) as e:
+                        print(f"[WARN] Failed to stringify {key} field for item {idx}: {e}")
+                        it[key] = None
+            valid_items.append(it)
+
+        clean_items = valid_items
+        print(f"[STRINGIFY_MULTI] Stringified {stringified_count} data fields, kept {len(clean_items)} valid items")
+
+    # Recursive function to remove None values from nested structures
+    def remove_none_recursive(obj):
+        if obj is None:
+            return None
+        elif isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                cleaned_v = remove_none_recursive(v)
+                if cleaned_v is not None:
+                    result[k] = cleaned_v
+            return result  # Return dict/list even if empty
+        elif isinstance(obj, list):
+            result = []
+            for item in obj:
+                cleaned_item = remove_none_recursive(item)
+                if cleaned_item is not None:
+                    result.append(cleaned_item)
+            return result  # Return dict/list even if empty
+        else:
+            return obj
 
     # Create DataFrame
+    print(f"[DATAFRAME_MULTI] Creating Spark DataFrame from {len(clean_items)} items")
+    # Log segments for debugging
+    segments = set()
+    for item in clean_items[:10]:  # Check first 10 items
+        if isinstance(item, dict) and 'segment' in item:
+            segments.add(item.get('segment'))
+    print(f"[DATAFRAME_MULTI] Sample segments: {segments}")
     spark = glueContext.spark_session
-    df = spark.createDataFrame(clean_items)
 
-    return df
+    if not clean_items:
+        print(f"[DATAFRAME_MULTI] No valid items, returning empty DataFrame")
+        from pyspark.sql.types import StructType, StructField, StringType
+        empty_schema = StructType([
+            StructField("listing_id", StringType(), True),
+            StructField("segment", StringType(), True)
+        ])
+        return spark.createDataFrame([], schema=empty_schema)
+
+    # Final safety check: remove any items that are None or not dict, and recursively remove None values
+    final_items = []
+    for item in clean_items:
+        if item is None or not isinstance(item, dict):
+            continue
+        # Recursively remove None values from within the dict (Spark can't handle None in nested structures)
+        cleaned_item = remove_none_recursive(item)
+        if cleaned_item:  # Only add if there are any non-None values
+            final_items.append(cleaned_item)
+
+    if len(final_items) < len(clean_items):
+        print(f"[DATAFRAME_MULTI] Filtered out {len(clean_items) - len(final_items)} invalid items")
+
+    if not final_items:
+        print(f"[DATAFRAME_MULTI] No valid items after filtering, returning empty DataFrame")
+        from pyspark.sql.types import StructType, StructField, StringType
+        empty_schema = StructType([
+            StructField("listing_id", StringType(), True),
+            StructField("segment", StringType(), True)
+        ])
+        return spark.createDataFrame([], schema=empty_schema)
+
+    try:
+        df = spark.createDataFrame(final_items)
+        print(f"[DATAFRAME_MULTI] Created DataFrame with {df.count()} rows and {len(df.columns)} columns")
+        print(f"[DATAFRAME_MULTI] Columns: {df.columns}")
+        return df
+    except Exception as e:
+        print(f"[ERROR] Failed to create DataFrame: {e}")
+        print(f"[ERROR] Sample of items causing issue:")
+        for i, item in enumerate(final_items[:3]):
+            print(f"[ERROR] Item {i}: {type(item)}, keys: {list(item.keys()) if isinstance(item, dict) else 'NOT A DICT'}")
+            if isinstance(item, dict):
+                for k, v in list(item.items())[:5]:
+                    print(f"[ERROR]   {k}: {type(v)}")
+                    # If it's a dict, show its contents
+                    if isinstance(v, dict):
+                        print(f"[ERROR]     Contents: {v}")
+        raise
 
 
 def _safe_extract_numeric(col_name, df):
@@ -1733,12 +2433,28 @@ def migrate_catalog_segment_to_search_aggregator_v2(
 
     _log(logger, f"[SEARCH_CATALOG] Starting catalog migration - listing_ids={test_listing_ids}, client_ids={test_client_ids}")
 
-    # Determine if we can use fast path (only works for listing_ids, not client_ids)
-    # DISABLED: Fast path causes boto3 AttributeError issues with malformed DynamoDB data
-    can_use_fast_path = False  # (len(test_listing_ids) > 0 and len(test_client_ids) == 0)
+    # Convert client IDs to listing IDs if needed (to enable fast path)
+    if test_client_ids:
+        if test_listing_ids:
+            # Already have listing_ids, just clear client_ids
+            _log(logger, f"[SEARCH_CATALOG] Listing IDs already provided, clearing client_ids to enable fast path")
+            test_client_ids = []
+        else:
+            # Convert client IDs to listing IDs
+            _log(logger, f"[SEARCH_CATALOG] Converting {len(test_client_ids)} client ID(s) to listing IDs using client-id-index")
+            test_listing_ids = get_listing_ids_for_clients(
+                glueContext, logger, country_code, source_listings_table, source_region, test_client_ids
+            )
+            _log(logger, f"[SEARCH_CATALOG] Found {len(test_listing_ids)} listing IDs from client IDs")
+            # Clear client_ids to enable fast path
+            test_client_ids = []
+
+    # Determine if we can use fast path (use whenever we have listing_ids)
+    # Fast path avoids CANNOT_MERGE_TYPE errors by reading all segments at once with stringify_complex=True
+    can_use_fast_path = (len(test_listing_ids) > 0)
     run_all = (len(test_listing_ids) == 0 and len(test_client_ids) == 0)
 
-    _log(logger, f"[SEARCH_CATALOG] can_use_fast_path={can_use_fast_path} (DISABLED), run_all={run_all}")
+    _log(logger, f"[SEARCH_CATALOG] can_use_fast_path={can_use_fast_path}, run_all={run_all}")
 
     if can_use_fast_path:
         # FAST PATH: Query the table directly by partition key
@@ -1779,13 +2495,28 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         # Cannot read full table with all segments because data column has different types
         _log(logger, f"[SEARCH_CATALOG] Using SLOW PATH - reading METADATA segment first")
 
-        # Read only METADATA segment to get base information
-        meta_filter = {
-            "dynamodb.filter.expression": "segment = :seg OR SK = :seg",
-            "dynamodb.filter.expressionAttributeValues": '{":seg":{"S":"SEGMENT#METADATA"}}'
-        }
-        dyf = read_ddb_table(glueContext, source_listings_table, source_region, scan_filter=meta_filter)
-        base = dyf.toDF()
+        # Get listing IDs from client IDs if needed
+        listing_ids_to_use = test_listing_ids or []
+        if not listing_ids_to_use and test_client_ids:
+            _log(logger, f"[SEARCH_CATALOG] Looking up listing IDs for {len(test_client_ids)} client(s)")
+            listing_ids_to_use = get_listing_ids_for_clients(
+                glueContext, logger, country_code, source_listings_table, source_region, test_client_ids
+            )
+            _log(logger, f"[SEARCH_CATALOG] Found {len(listing_ids_to_use)} listings for clients")
+
+        # OPTIMIZED: Use BatchGetItem if we have listing IDs
+        if not run_all and listing_ids_to_use:
+            _log(logger, f"[SEARCH_CATALOG] Using BatchGetItem for {len(listing_ids_to_use)} listing(s) (100x faster)")
+            base = read_segment_targeted(glueContext, source_listings_table, source_region, listing_ids_to_use, "METADATA")
+        else:
+            # Fallback to scan for run_all mode
+            _log(logger, f"[SEARCH_CATALOG] Using table scan (run_all mode)")
+            meta_filter = {
+                "dynamodb.filter.expression": "segment = :seg OR SK = :seg",
+                "dynamodb.filter.expressionAttributeValues": '{":seg":{"S":"SEGMENT#METADATA"}}'
+            }
+            dyf = read_ddb_table(glueContext, source_listings_table, source_region, scan_filter=meta_filter)
+            base = dyf.toDF()
 
         _log(logger, f"[SEARCH_CATALOG] Read {base.count()} METADATA records")
 
@@ -1793,9 +2524,10 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         if not seg_col:
             raise ValueError(f"{source_listings_table} missing '{SEGMENT_COL}'/'{SK_COL}'")
 
-        # Apply filters
-        base = _apply_test_filters(base, test_listing_ids, test_client_ids, run_all)
-        _log(logger, f"[SEARCH_CATALOG] After filters: {base.count()} records")
+        # Apply filters (only needed if we used scan)
+        if run_all or not listing_ids_to_use:
+            base = _apply_test_filters(base, test_listing_ids, test_client_ids, run_all)
+            _log(logger, f"[SEARCH_CATALOG] After filters: {base.count()} records")
 
         # Log which listings we're processing
         found_listings = base.select(LISTING_ID_COL).distinct().rdd.map(lambda r: r[0]).collect()
@@ -1822,15 +2554,22 @@ def migrate_catalog_segment_to_search_aggregator_v2(
     else:
         # Slow path: read each segment separately to avoid CANNOT_MERGE_TYPE
         def read_segment_separately(segment_name):
-            seg_filter = {
-                "dynamodb.filter.expression": f"{seg_col} = :seg",
-                "dynamodb.filter.expressionAttributeValues": '{":seg":{"S":"SEGMENT#' + segment_name + '"}}'
-            }
-            dyf_seg = read_ddb_table(glueContext, source_listings_table, source_region, scan_filter=seg_filter)
-            df_seg = dyf_seg.toDF()
-            # Filter by listing IDs if we have them
-            if test_listing_ids:
-                df_seg = df_seg.filter(F.col(LISTING_ID_COL).isin(test_listing_ids))
+            # OPTIMIZED: Use BatchGetItem if we have listing IDs
+            if test_listing_ids and not run_all:
+                _log(logger, f"[SEARCH_CATALOG] Reading {segment_name} using BatchGetItem for {len(test_listing_ids)} listing(s)")
+                df_seg = read_segment_targeted(glueContext, source_listings_table, source_region, test_listing_ids, segment_name)
+            else:
+                # Fallback to scan for run_all mode
+                _log(logger, f"[SEARCH_CATALOG] Reading {segment_name} using table scan")
+                seg_filter = {
+                    "dynamodb.filter.expression": f"{seg_col} = :seg",
+                    "dynamodb.filter.expressionAttributeValues": '{":seg":{"S":"SEGMENT#' + segment_name + '"}}'
+                }
+                dyf_seg = read_ddb_table(glueContext, source_listings_table, source_region, scan_filter=seg_filter)
+                df_seg = dyf_seg.toDF()
+                # Filter by listing IDs if we have them
+                if test_listing_ids:
+                    df_seg = df_seg.filter(F.col(LISTING_ID_COL).isin(test_listing_ids))
             return _latest_per_segment_v2(df_seg, seg_col, segment_name)
 
         attr  = read_segment_separately("ATTRIBUTES")
@@ -1849,17 +2588,215 @@ def migrate_catalog_segment_to_search_aggregator_v2(
     if "client_reference" in base.columns:
         base = base.withColumn("reference", F.col("client_reference"))
 
+    # Build list of columns to aggregate - only include columns that exist
+    base_cols_to_aggregate = ["client_id", "location_id", "reference", "created_at", "updated_at", "version"]
+
+    # Add first_published_at only if it exists (it's only in METADATA segment)
+    if "first_published_at" in base.columns:
+        base_cols_to_aggregate.append("first_published_at")
+
     base_cols = _group_first_non_null_v2(
         base, LISTING_ID_COL,
-        ["client_id", "location_id", "reference", "created_at", "updated_at", "first_published_at", "version"]
+        base_cols_to_aggregate
     )
     _log(logger, f"[SEARCH_CATALOG] Base columns for {base_cols.count()} listings")
+
+    # ---------- PARSE JSON STRINGS BACK TO STRUCTS ----------
+    # Parse stringified complex fields back to their proper types for extraction
+    # Each segment has a consistent 'data' type, so we can parse it correctly per segment
+    _log(logger, "[SEARCH_CATALOG] Parsing JSON strings back to structs for extraction...")
+    from pyspark.sql.types import StringType
+
+    # Parse 'data' field per segment (each segment has consistent data type)
+    # Use schema_of_json to infer the correct schema from sample data
+    if "data" in attr.columns and isinstance(attr.schema["data"].dataType, StringType):
+        # ATTRIBUTES: Infer schema from MULTIPLE samples to capture all fields (e.g., owner_name)
+        # Single sample may miss optional fields that aren't present in every record
+        import json
+        sample_jsons = attr.filter(F.col("data").isNotNull()).select("data").limit(50).collect()
+        if sample_jsons:
+            # Merge schemas from multiple samples
+            merged_schema = {}
+            for row in sample_jsons:
+                if row[0]:
+                    try:
+                        obj = json.loads(row[0])
+                        if isinstance(obj, dict):
+                            # Merge keys - keep any non-null value as example
+                            for k, v in obj.items():
+                                if k not in merged_schema or merged_schema[k] is None:
+                                    merged_schema[k] = v
+                    except:
+                        pass
+
+            if merged_schema:
+                merged_json = json.dumps(merged_schema)
+                inferred_schema = F.schema_of_json(F.lit(merged_json))
+                _log(logger, f"[SEARCH_CATALOG] ATTRIBUTES data schema inferred from {len(sample_jsons)} samples")
+                _log(logger, f"[SEARCH_CATALOG] ATTRIBUTES merged schema keys: {list(merged_schema.keys())}")
+                attr = attr.withColumn("data", F.from_json(F.col("data"), inferred_schema))
+
+    if "description" in desc.columns and isinstance(desc.schema["description"].dataType, StringType):
+        desc = desc.withColumn("description", F.from_json(F.col("description"), "map<string,string>"))
+
+    if "data" in price.columns and isinstance(price.schema["data"].dataType, StringType):
+        # PRICE: Use explicit schema to ensure all amounts fields are captured
+        from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType, ArrayType
+        price_schema = StructType([
+            StructField("FilterAmount", LongType(), True),
+            StructField("SortAmount", LongType(), True),
+            StructField("amount", LongType(), True),
+            StructField("amounts", StructType([
+                StructField("sale", LongType(), True),
+                StructField("sell", LongType(), True),
+                StructField("monthly", LongType(), True),
+                StructField("yearly", LongType(), True),
+            ]), True),
+            StructField("downpayment", LongType(), True),
+            StructField("minimal_rental_period", StringType(), True),
+            StructField("mortgage", StringType(), True),
+            StructField("number_of_cheques", LongType(), True),
+            StructField("number_of_mortgage_years", LongType(), True),
+            StructField("obligation", StringType(), True),
+            StructField("on_request", BooleanType(), True),
+            StructField("payment_methods", ArrayType(StringType(), True), True),
+            StructField("type", StringType(), True),
+            StructField("utilities_inclusive", BooleanType(), True),
+            StructField("value_affected", StringType(), True),
+        ])
+        _log(logger, f"[SEARCH_CATALOG] PRICE data parsing with explicit schema including all amounts fields")
+        price = price.withColumn("data", F.from_json(F.col("data"), price_schema))
+
+    if "data" in amen.columns and isinstance(amen.schema["data"].dataType, StringType):
+        # AMENITIES: data is an array of strings
+        amen = amen.withColumn("data", F.from_json(F.col("data"), "array<string>"))
+
+    if "hashes" in meta.columns and isinstance(meta.schema["hashes"].dataType, StringType):
+        meta = meta.withColumn("hashes", F.from_json(F.col("hashes"), "map<string,string>"))
+
+    if "web_ids" in meta.columns and isinstance(meta.schema["web_ids"].dataType, StringType):
+        meta = meta.withColumn("web_ids", F.from_json(F.col("web_ids"), "array<string>"))
+
+    if "data" in state.columns and isinstance(state.schema["data"].dataType, StringType):
+        # STATE: Infer schema from first non-null value
+        sample_json = state.filter(F.col("data").isNotNull()).select("data").first()
+        if sample_json and sample_json[0]:
+            inferred_schema = F.schema_of_json(sample_json[0])
+            state = state.withColumn("data", F.from_json(F.col("data"), inferred_schema))
 
     # ---------- EXTRACT FIELDS USING HELPER FUNCTIONS ----------
     _log(logger, "[SEARCH_CATALOG] Extracting fields from each segment...")
     attr_sel = _extract_attr_fields_v2(attr)
     desc_sel = _extract_description_fields_v2(desc)
     price_sel = _extract_price_fields_v2(price)
+
+    # Extract obligation field if it exists in the price data schema
+    if "data" in price.columns:
+        from pyspark.sql.types import StructType, StringType
+        data_type = price.schema["data"].dataType
+        if isinstance(data_type, StructType):
+            # Check if obligation field exists in the struct
+            field_names = {field.name: field.dataType for field in data_type.fields}
+            if "obligation" in field_names:
+                _log(logger, "[SEARCH_CATALOG] Obligation field found in price data, extracting...")
+                obligation_type = field_names["obligation"]
+
+                if isinstance(obligation_type, StructType):
+                    # Obligation is already a struct, extract directly
+                    price_sel = price_sel.join(
+                        price.select(
+                            LISTING_ID_COL,
+                            F.when(
+                                F.col("data.obligation").isNotNull(),
+                                F.struct(
+                                    F.col("data.obligation.comment").alias("comment"),
+                                    F.col("data.obligation.enabled").alias("enabled")
+                                )
+                            ).alias("price_obligation_extracted")
+                        ),
+                        LISTING_ID_COL,
+                        "left"
+                    )
+                elif isinstance(obligation_type, StringType):
+                    # Obligation is a JSON string, parse it first
+                    _log(logger, "[SEARCH_CATALOG] Obligation is StringType, parsing JSON...")
+                    price_sel = price_sel.join(
+                        price.select(
+                            LISTING_ID_COL,
+                            F.when(
+                                F.col("data.obligation").isNotNull(),
+                                F.from_json(
+                                    F.col("data.obligation"),
+                                    "struct<comment:string,enabled:boolean>"
+                                )
+                            ).alias("price_obligation_extracted")
+                        ),
+                        LISTING_ID_COL,
+                        "left"
+                    )
+
+                # Replace the null obligation with the extracted one
+                price_sel = price_sel.withColumn(
+                    "price_obligation",
+                    F.coalesce(F.col("price_obligation_extracted"), F.col("price_obligation"))
+                ).drop("price_obligation_extracted")
+
+            # Extract mortgage field if it exists
+            if "mortgage" in field_names:
+                mortgage_type = field_names["mortgage"]
+                _log(logger, f"[SEARCH_CATALOG] Mortgage field found in price data, type: {mortgage_type}")
+
+                if isinstance(mortgage_type, StructType):
+                    price_sel = price_sel.join(
+                        price.select(
+                            LISTING_ID_COL,
+                            F.when(
+                                F.col("data.mortgage").isNotNull(),
+                                F.struct(
+                                    F.col("data.mortgage.comment").alias("comment"),
+                                    F.col("data.mortgage.enabled").alias("enabled")
+                                )
+                            ).alias("price_mortgage_extracted")
+                        ),
+                        LISTING_ID_COL,
+                        "left"
+                    )
+                    price_sel = price_sel.withColumn(
+                        "price_mortgage",
+                        F.coalesce(F.col("price_mortgage_extracted"), F.col("price_mortgage"))
+                    ).drop("price_mortgage_extracted")
+
+            # Extract value_affected field if it exists
+            if "value_affected" in field_names:
+                value_affected_type = field_names["value_affected"]
+                _log(logger, f"[SEARCH_CATALOG] Value_affected field found in price data, type: {value_affected_type}")
+
+                if isinstance(value_affected_type, StructType):
+                    price_sel = price_sel.join(
+                        price.select(
+                            LISTING_ID_COL,
+                            F.when(
+                                F.col("data.value_affected").isNotNull(),
+                                F.struct(
+                                    F.col("data.value_affected.comment").alias("comment"),
+                                    F.col("data.value_affected.enabled").alias("enabled")
+                                )
+                            ).alias("price_value_affected_extracted")
+                        ),
+                        LISTING_ID_COL,
+                        "left"
+                    )
+                    price_sel = price_sel.withColumn(
+                        "price_value_affected",
+                        F.coalesce(F.col("price_value_affected_extracted"), F.col("price_value_affected"))
+                    ).drop("price_value_affected_extracted")
+
+    # Debug: Log price extraction results
+    _log(logger, "[SEARCH_CATALOG] DEBUG: Checking price amounts extraction...")
+    price_sample = price_sel.select("listing_id", "price_amount_sell", "price_amount_monthly", "price_amount_yearly").limit(5).collect()
+    for row in price_sample:
+        _log(logger, f"[SEARCH_CATALOG] DEBUG: listing_id={row['listing_id']}, sell={row['price_amount_sell']}, monthly={row['price_amount_monthly']}, yearly={row['price_amount_yearly']}")
+
     amen_sel = _extract_amenities_fields_v2(amen)
     meta_sel = _extract_metadata_fields_v2(meta)
     state_sel = _extract_state_fields_v2(state, STATE_DATA_COL)
@@ -1876,10 +2813,32 @@ def migrate_catalog_segment_to_search_aggregator_v2(
           .join(state_sel, LISTING_ID_COL, "left"))
     _log(logger, f"[SEARCH_CATALOG] Joined dataframe has {df.count()} rows")
 
+    # Debug: Check street and direction after join
+    _log(logger, "[SEARCH_CATALOG] DEBUG: Checking street/direction after join...")
+    street_sample = df.select(LISTING_ID_COL, "street", "direction").filter(F.col("street").isNotNull()).limit(3).collect()
+    for row in street_sample:
+        _log(logger, f"[SEARCH_CATALOG] DEBUG: listing_id={row[LISTING_ID_COL]}, street={row['street']}, direction={row['direction']}")
+
     # ---------- NORMALIZATION ----------
     _log(logger, "[SEARCH_CATALOG] Building normalized data structure...")
     amenities_arr = F.col("amenities_arr")
-    pm_arr = F.from_json(F.col("price_payment_methods_json"), "array<string>")
+
+    # Payment methods - handle both string (JSON) and array types
+    # Check if it's already an array or needs parsing
+    from pyspark.sql.types import ArrayType, StringType
+    pm_col_type = None
+    if "price_payment_methods_json" in df.columns:
+        pm_col_type = df.schema["price_payment_methods_json"].dataType
+
+    if isinstance(pm_col_type, ArrayType):
+        # Already an array, use directly
+        pm_arr = F.col("price_payment_methods_json")
+    elif isinstance(pm_col_type, StringType):
+        # String type, parse as JSON
+        pm_arr = F.from_json(F.col("price_payment_methods_json"), "array<string>")
+    else:
+        # Column doesn't exist or is null, use null
+        pm_arr = F.lit(None).cast("array<string>")
 
     df = (df
         .withColumn("country", F.lit(str(country_code).lower()))
@@ -1893,32 +2852,49 @@ def migrate_catalog_segment_to_search_aggregator_v2(
                     F.when(F.col("parkingSlots").isNotNull(),
                            F.col("parkingSlots").cast("int")))
 
-        # Size is already unwrapped in _extract_attr_fields_v2, just cast to int
+        # Size is already unwrapped in _extract_attr_fields_v2 and cast to double, keep as double/float
         .withColumn("size",
                     F.when(F.col("size").isNotNull(),
-                           F.col("size").cast("int")))
+                           F.col("size").cast("double")))
 
-        # numberOfFloors - already BIGINT
+        # numberOfFloors - preserve null values explicitly
         .withColumn("numberOfFloors",
                     F.when(F.col("numberOfFloors").isNotNull(),
-                           F.col("numberOfFloors").cast("int")))
+                           F.col("numberOfFloors").cast("int")).otherwise(F.lit(None).cast("int")))
 
-        # plotSize - extract value from struct or use direct value
+        # plotSize - preserve null values explicitly
         .withColumn("plotSize",
                     F.when(F.col("plotSize").isNotNull(),
-                           _safe_extract_numeric("plotSize", df).cast("int")))
+                           _safe_extract_numeric("plotSize", df).cast("int")).otherwise(F.lit(None).cast("int")))
 
-        .withColumn("age", F.col("age").cast("int"))
+        .withColumn("age",
+                    F.when(F.col("age").isNotNull(), F.col("age").cast("int")))
+
+        # Boolean fields - explicitly cast to preserve false values
+        .withColumn("hasGarden", F.col("hasGarden").cast("boolean"))
+        .withColumn("hasKitchen", F.col("hasKitchen").cast("boolean"))
+        .withColumn("hasParkingOnSite", F.col("hasParkingOnSite").cast("boolean"))
 
         .withColumn("state_struct", F.struct(
             F.col("state_stage").alias("stage"),
             F.col("state_type").alias("type"),
-            F.when(F.col("state_reasons").isNotNull(), F.col("state_reasons")).alias("reasons")
+            F.when(
+                F.col("state_reasons").isNotNull() & (F.size(F.col("state_reasons")) > 0),
+                F.col("state_reasons")
+            ).alias("reasons")
         ))
 
         .withColumn("assignedTo_struct",
             F.when(F.col("meta_assigned_to_id").isNotNull(),
                    F.struct(F.col("meta_assigned_to_id").cast("string").alias("id"))))
+
+        .withColumn("createdBy_struct",
+            F.when(F.col("meta_created_by_id").isNotNull(),
+                   F.struct(F.col("meta_created_by_id").cast("string").alias("id"))))
+
+        .withColumn("updatedBy_struct",
+            F.when(F.col("meta_updated_by_id").isNotNull(),
+                   F.struct(F.col("meta_updated_by_id").cast("string").alias("id"))))
 
         .withColumn("client_struct", F.struct(F.col("client_id").cast("string").alias("id")))
         .withColumn("location_struct", F.struct(F.col("location_id").cast("string").alias("id")))
@@ -1929,17 +2905,40 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         .withColumn("price_struct", F.struct(
             F.col("price_type").alias("type"),
             F.struct(
-                F.when(F.col("price_amount_sell").isNotNull(), F.col("price_amount_sell")).alias("sell"),
-                F.when(F.col("price_amount_monthly").isNotNull(), F.col("price_amount_monthly")).alias("monthly"),
-                F.when(F.col("price_amount_yearly").isNotNull(), F.col("price_amount_yearly")).alias("yearly"),
+                F.col("price_amount_sell").alias("sale"),
+                F.col("price_amount_monthly").alias("monthly"),
+                F.col("price_amount_yearly").alias("yearly"),
             ).alias("amounts"),
             F.col("price_downpayment").alias("downpayment"),
             F.when(pm_arr.isNotNull(), pm_arr).otherwise(F.array()).alias("paymentMethods"),
+            F.when(F.col("price_utilities_inclusive").isNotNull(), F.col("price_utilities_inclusive").cast("boolean")).alias("utilitiesInclusive"),
+            F.col("price_number_years").alias("numberOfMortgageYears"),
+            F.col("price_number_of_cheques").alias("numberOfCheques"),
+            F.when(F.col("price_on_request").isNotNull(), F.col("price_on_request").cast("boolean")).alias("onRequest"),
+            F.when(F.col("price_filter_amount").isNotNull(), F.col("price_filter_amount")).alias("filter_amount"),
+            F.when(F.col("price_sort_amount").isNotNull(), F.col("price_sort_amount")).alias("sort_amount"),
+            F.when(F.col("price_obligation").isNotNull(), F.col("price_obligation")).alias("obligation"),
+            F.when(F.col("price_mortgage").isNotNull(), F.col("price_mortgage")).alias("mortgage"),
+            F.when(F.col("price_value_affected").isNotNull(), F.col("price_value_affected")).alias("valueAffected"),
         ))
 
         .withColumn("createdAt", F.col("created_at").cast("string"))
         .withColumn("updatedAt", F.col("updated_at").cast("string"))
     )
+
+    # Add publishedAt and firstPublishedAt BEFORE creating data_struct
+    if "meta_published_at" in df.columns and "meta_first_published_at" in df.columns:
+        df = df.withColumn("publishedAt", F.coalesce(F.col("meta_published_at"), F.col("meta_first_published_at")))
+        df = df.withColumn("firstPublishedAt", F.col("meta_first_published_at"))
+    elif "meta_published_at" in df.columns:
+        df = df.withColumn("publishedAt", F.col("meta_published_at"))
+        df = df.withColumn("firstPublishedAt", F.lit(None).cast("string"))
+    elif "meta_first_published_at" in df.columns:
+        df = df.withColumn("publishedAt", F.col("meta_first_published_at"))
+        df = df.withColumn("firstPublishedAt", F.col("meta_first_published_at"))
+    else:
+        df = df.withColumn("publishedAt", F.lit(None).cast("string"))
+        df = df.withColumn("firstPublishedAt", F.lit(None).cast("string"))
 
     # ---------- DATA STRUCT ----------
     now_z = F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss'Z'")
@@ -1956,9 +2955,12 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         F.col("category"),
         F.col("client_struct").alias("client"),
         F.col("createdAt"),
+        F.col("createdBy_struct").alias("createdBy"),
         F.col("desc_struct").alias("description"),
         F.col("developer"),
+        F.col("direction"),
         F.col("finishingType"),
+        F.when(F.col("firstPublishedAt").isNotNull(), F.col("firstPublishedAt")).alias("firstPublishedAt"),
         F.col("floorNumber"),
         F.col("furnishingType"),
         F.col("hasGarden"),
@@ -1967,15 +2969,16 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         F.col("id"),
         F.col("landNumber"),
         F.col("location_struct").alias("location"),
-        F.col("numberOfFloors"),
+        F.when(F.col("numberOfFloors").isNotNull(), F.col("numberOfFloors")).alias("numberOfFloors"),
         F.col("ownerName"),
         F.col("parkingSlots"),
         F.col("plotNumber"),
-        F.col("plotSize"),
+        F.when(F.col("plotSize").isNotNull(), F.col("plotSize")).alias("plotSize"),
         F.col("price_struct").alias("price"),
         F.col("projectStatus"),
+        F.when(F.col("publishedAt").isNotNull(), F.col("publishedAt")).alias("publishedAt"),
         F.col("street"),
-        F.col("id").alias("reference"),
+        F.coalesce(F.col("meta_reference"), F.col("id")).alias("reference"),
         F.col("size"),
         F.col("state_struct").alias("state"),
         F.col("title_struct").alias("title"),
@@ -1983,11 +2986,14 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         F.col("uaeEmirate"),
         F.col("unitNumber"),
         F.col("updatedAt"),
-        F.col("meta_published_at").alias("publishedAt"),
-        F.col("meta_first_published_at").alias("firstPublishedAt"),
-        F.when(F.col("meta_web_ids").isNotNull(), F.col("meta_web_ids")).alias("webIds")
-
+        F.col("updatedBy_struct").alias("updatedBy")
     )
+
+    # Add webIds if available
+    if "meta_web_ids" in df.columns:
+        df = df.withColumn("webIds", F.when(F.col("meta_web_ids").isNotNull(), F.col("meta_web_ids")))
+    else:
+        df = df.withColumn("webIds", F.lit(None).cast("string"))
 
     # Extract client IDs for logging BEFORE transformation
     _log(logger, "[SEARCH_CATALOG] Extracting client IDs for logging...")
@@ -1999,7 +3005,7 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         .withColumn("PK", F.col("id"))
         .withColumn("SK", F.lit("SEGMENT#catalog"))
         .withColumn("country", F.col("country"))
-        .withColumn("data", F.to_json(data_struct, {"ignoreNullFields": "false"}))
+        .withColumn("data", F.to_json(data_struct, {"ignoreNullFields": "true"}))
         .withColumn("status", F.lit("listing.updated"))
         .withColumn("updated_at", now_z)
         .withColumn("version", (F.unix_timestamp(F.current_timestamp()) * 1000000000).cast("bigint"))
@@ -3266,7 +4272,7 @@ def run_search_only(args, glueContext):
 
     run_all = (len(test_listing_ids) == 0 and len(test_client_ids) == 0)
 
-    _log(logger, f"[SEARCH v2] Resolved scope -> run_all={run_all}, test_listing_ids={test_listing_ids}, test_client_ids={test_client_ids}")
+    _log(logger, f"[SEARCH v2] Resolved scope -> run_all={run_all}, listing_count={len(test_listing_ids)}, client_count={len(test_client_ids)}")
     _log(logger, f"[SEARCH v2] Country: {country_code}, Source: {source_listings_table}, Target: {target_search_agg_table}")
 
     # MEDIA
