@@ -1535,15 +1535,29 @@ def _extract_attr_fields_v2(attr_df):
         safe_col(f"{data_prefix}.project_status", "projectStatus"),
         # Size field - extract as-is, will unwrap later if needed
         safe_col(f"{data_prefix}.size", "size_raw"),
-        # Transform street field - extract width as simple number (street) and direction as separate field
-        # Source has street.Width.long and street.Direction, output should be street (number) and direction (string)
-        (extract_numeric_value(f"{data_prefix}.street.Width").cast("int")
-         if has_nested_field(attr_df, f"{data_prefix}.street.Width")
-         else F.lit(None).cast("int")).alias("street"),
-        # Direction as separate field
-        (F.col(f"{data_prefix}.street.Direction")
-         if has_nested_field(attr_df, f"{data_prefix}.street.Direction")
-         else F.lit(None)).alias("direction"),
+        # Transform street field - create struct with width (int) and direction (string)
+        # Source has street.Width and street.Direction, output should be street: {width: N, direction: "X"}
+        # Handle both cases: street as struct (STRUCT<Direction: STRING, Width: BIGINT>) or as JSON string
+        (F.when(
+            F.col(f"{data_prefix}.street").isNotNull(),
+            F.struct(
+                # Try struct access first (when street is already a struct), fallback to JSON parsing
+                F.coalesce(
+                    F.col(f"{data_prefix}.street.Width") if has_nested_field(attr_df, f"{data_prefix}.street.Width") else F.lit(None),
+                    F.when(F.col(f"{data_prefix}.street").cast("string").rlike(r'^\s*\{'),
+                           F.coalesce(
+                               F.get_json_object(F.col(f"{data_prefix}.street").cast("string"), "$.Width.long"),
+                               F.get_json_object(F.col(f"{data_prefix}.street").cast("string"), "$.Width")
+                           ))
+                ).cast("int").alias("width"),
+                F.coalesce(
+                    F.col(f"{data_prefix}.street.Direction") if has_nested_field(attr_df, f"{data_prefix}.street.Direction") else F.lit(None),
+                    F.when(F.col(f"{data_prefix}.street").cast("string").rlike(r'^\s*\{'),
+                           F.get_json_object(F.col(f"{data_prefix}.street").cast("string"), "$.Direction"))
+                ).alias("direction")
+            )
+        ) if has_nested_field(attr_df, f"{data_prefix}.street")
+         else F.lit(None)).alias("street"),
         F.coalesce(
             F.col("type") if "type" in attr_df.columns else F.lit(None),
             F.col(f"{data_prefix}.type") if has_nested_field(attr_df, f"{data_prefix}.type") else F.lit(None)
@@ -1587,10 +1601,14 @@ def _extract_attr_fields_v2(attr_df):
     for row in sample_owner:
         print(f"[EXTRACT_ATTRIBUTES] listing_id={row[LISTING_ID_COL]}, ownerName={row['ownerName']}")
 
-    # Debug: Check street and direction extraction
-    sample_street = result_df.select(LISTING_ID_COL, "street", "direction").limit(3).collect()
+    # Debug: Check street struct extraction
+    sample_street = result_df.select(LISTING_ID_COL, "street").filter(F.col("street").isNotNull()).limit(3).collect()
     for row in sample_street:
-        print(f"[EXTRACT_ATTRIBUTES] listing_id={row[LISTING_ID_COL]}, street={row['street']}, direction={row['direction']}")
+        street_obj = row['street']
+        if street_obj:
+            print(f"[EXTRACT_ATTRIBUTES] listing_id={row[LISTING_ID_COL]}, street.width={street_obj.width}, street.direction={street_obj.direction}")
+        else:
+            print(f"[EXTRACT_ATTRIBUTES] listing_id={row[LISTING_ID_COL]}, street=None")
 
     return result_df
 
@@ -1700,8 +1718,11 @@ def _extract_price_fields_v2(price_df):
             ) if has_nested_field(price_df, f"{data_prefix}.amounts.yearly") else F.lit(None)
         )).alias("price_amount_yearly"),
 
-        # Downpayment - already BIGINT
-        safe_col(f"{data_prefix}.downpayment", "price_downpayment", "long"),
+        # Downpayment - already BIGINT, default to 0 if not present
+        F.coalesce(
+            safe_col(f"{data_prefix}.downpayment", "price_downpayment", "long"),
+            F.lit(0).cast("long")
+        ).alias("price_downpayment"),
 
         # Number of mortgage years - already BIGINT
         safe_col(f"{data_prefix}.number_of_mortgage_years", "price_number_years", "long"),
@@ -2304,7 +2325,7 @@ def read_ddb_for_test_listings(table_name, region, listing_ids, glueContext, str
                         it[key] = json.dumps(value_converted)
                         stringified_count += 1
                     except (TypeError, AttributeError) as e:
-                        print(f"[WARN] Failed to stringify {key} field for item {idx}: {e}")
+#                         print(f"[WARN] Failed to stringify {key} field for item {idx}: {e}")
                         it[key] = None
             valid_items.append(it)
 
@@ -2804,6 +2825,13 @@ def migrate_catalog_segment_to_search_aggregator_v2(
 
     # ---------- JOIN ----------
     _log(logger, "[SEARCH_CATALOG] Joining all segments...")
+
+    # Debug: Check if street exists in base_cols before join
+    _log(logger, f"[SEARCH_CATALOG] DEBUG: base_cols columns: {base_cols.columns}")
+    _log(logger, f"[SEARCH_CATALOG] DEBUG: attr_sel columns: {attr_sel.columns}")
+    _log(logger, f"[SEARCH_CATALOG] DEBUG: 'street' in base_cols: {'street' in base_cols.columns}")
+    _log(logger, f"[SEARCH_CATALOG] DEBUG: 'street' in attr_sel: {'street' in attr_sel.columns}")
+
     df = (base_cols
           .join(attr_sel,  LISTING_ID_COL, "left")
           .join(desc_sel,  LISTING_ID_COL, "left")
@@ -2813,11 +2841,15 @@ def migrate_catalog_segment_to_search_aggregator_v2(
           .join(state_sel, LISTING_ID_COL, "left"))
     _log(logger, f"[SEARCH_CATALOG] Joined dataframe has {df.count()} rows")
 
-    # Debug: Check street and direction after join
-    _log(logger, "[SEARCH_CATALOG] DEBUG: Checking street/direction after join...")
-    street_sample = df.select(LISTING_ID_COL, "street", "direction").filter(F.col("street").isNotNull()).limit(3).collect()
+    # Debug: Check street struct after join
+    _log(logger, "[SEARCH_CATALOG] DEBUG: Checking street struct after join...")
+    street_sample = df.select(LISTING_ID_COL, "street").filter(F.col("street").isNotNull()).limit(3).collect()
     for row in street_sample:
-        _log(logger, f"[SEARCH_CATALOG] DEBUG: listing_id={row[LISTING_ID_COL]}, street={row['street']}, direction={row['direction']}")
+        street_obj = row['street']
+        if street_obj:
+            _log(logger, f"[SEARCH_CATALOG] DEBUG: listing_id={row[LISTING_ID_COL]}, street.width={street_obj.width}, street.direction={street_obj.direction}")
+        else:
+            _log(logger, f"[SEARCH_CATALOG] DEBUG: listing_id={row[LISTING_ID_COL]}, street=None")
 
     # ---------- NORMALIZATION ----------
     _log(logger, "[SEARCH_CATALOG] Building normalized data structure...")
@@ -2909,7 +2941,7 @@ def migrate_catalog_segment_to_search_aggregator_v2(
                 F.col("price_amount_monthly").alias("monthly"),
                 F.col("price_amount_yearly").alias("yearly"),
             ).alias("amounts"),
-            F.col("price_downpayment").alias("downpayment"),
+            F.coalesce(F.col("price_downpayment"), F.lit(0).cast("long")).alias("downpayment"),
             F.when(pm_arr.isNotNull(), pm_arr).otherwise(F.array()).alias("paymentMethods"),
             F.when(F.col("price_utilities_inclusive").isNotNull(), F.col("price_utilities_inclusive").cast("boolean")).alias("utilitiesInclusive"),
             F.col("price_number_years").alias("numberOfMortgageYears"),
@@ -2941,6 +2973,15 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         df = df.withColumn("firstPublishedAt", F.lit(None).cast("string"))
 
     # ---------- DATA STRUCT ----------
+    # Debug: Check street column type before creating data_struct
+    _log(logger, f"[SEARCH_CATALOG] DEBUG: Checking street column type before data_struct...")
+    _log(logger, f"[SEARCH_CATALOG] DEBUG: street column type: {df.schema['street'].dataType}")
+    street_before_struct = df.select(LISTING_ID_COL, "street").filter(F.col("street").isNotNull()).limit(2).collect()
+    for row in street_before_struct:
+        street_obj = row['street']
+        if street_obj:
+            _log(logger, f"[SEARCH_CATALOG] DEBUG: Before struct - listing_id={row[LISTING_ID_COL]}, street.width={street_obj.width}, street.direction={street_obj.direction}")
+
     now_z = F.date_format(F.current_timestamp(), "yyyy-MM-dd'T'HH:mm:ss'Z'")
     eventz = F.coalesce(F.col("updatedAt"), now_z)
 
@@ -2958,7 +2999,6 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         F.col("createdBy_struct").alias("createdBy"),
         F.col("desc_struct").alias("description"),
         F.col("developer"),
-        F.col("direction"),
         F.col("finishingType"),
         F.when(F.col("firstPublishedAt").isNotNull(), F.col("firstPublishedAt")).alias("firstPublishedAt"),
         F.col("floorNumber"),
@@ -3001,6 +3041,14 @@ def migrate_catalog_segment_to_search_aggregator_v2(
     client_ids_in_batch = [c for c in client_ids_in_batch if c is not None]
     _log(logger, f"[SEARCH_CATALOG] Found {len(client_ids_in_batch)} unique clients in this batch")
 
+    # Debug: Check data_struct before JSON serialization
+    _log(logger, "[SEARCH_CATALOG] DEBUG: Checking data_struct before JSON serialization...")
+    struct_sample = df.withColumn("data_struct_col", data_struct).select(LISTING_ID_COL, "data_struct_col.street").filter(F.col("data_struct_col.street").isNotNull()).limit(2).collect()
+    for row in struct_sample:
+        street_obj = row[1]
+        if street_obj:
+            _log(logger, f"[SEARCH_CATALOG] DEBUG: In data_struct - listing_id={row[LISTING_ID_COL]}, street.width={street_obj.width}, street.direction={street_obj.direction}")
+
     out = (df
         .withColumn("PK", F.col("id"))
         .withColumn("SK", F.lit("SEGMENT#catalog"))
@@ -3010,6 +3058,12 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         .withColumn("updated_at", now_z)
         .withColumn("version", (F.unix_timestamp(F.current_timestamp()) * 1000000000).cast("bigint"))
         .select("PK", "SK", "country", "data", "status", "updated_at", "version"))
+
+    # Debug: Check final JSON output
+    _log(logger, "[SEARCH_CATALOG] DEBUG: Checking final JSON output...")
+    json_sample = out.select("PK", "data").filter(F.col("data").contains("street")).limit(1).collect()
+    for row in json_sample:
+        _log(logger, f"[SEARCH_CATALOG] DEBUG: Final JSON for {row['PK']}: {row['data'][:500]}...")
 
     # Log which listings are being published
     published_count = out.count()

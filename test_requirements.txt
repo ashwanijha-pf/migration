@@ -1,0 +1,21 @@
+# Test dependencies for catalog.py unit tests
+
+# Core testing framework
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.11.1
+
+# Mocking and testing utilities
+mock>=5.1.0
+
+# AWS SDK for mocking
+boto3>=1.28.0
+botocore>=1.31.0
+moto>=4.2.0  # For mocking AWS services
+
+# PySpark for testing (use version compatible with AWS Glue)
+pyspark>=3.3.0
+
+# AWS Glue libraries (for local testing, may need custom installation)
+# Note: AWS Glue libraries are typically only available in Glue environment
+# For local testing, you may need to mock these or use stubs
