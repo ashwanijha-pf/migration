@@ -1867,7 +1867,12 @@ def _extract_metadata_fields_v2(meta_df):
 
 
 def _extract_state_fields_v2(state_df, state_col_name="data"):
-    """Extract and normalize state segment fields"""
+    """
+    Extract and normalize state segment fields.
+    
+    Applies STATE_TYPE_MAP to transform state types from Listing Service to Catalog Service format.
+    Extracts state_type from data.type or falls back to state_type column.
+    """
     from pyspark.sql import functions as F
     from pyspark.sql.types import ArrayType, StringType
 
@@ -1883,7 +1888,7 @@ def _extract_state_fields_v2(state_df, state_col_name="data"):
     has_struct_wrapper = has_nested_field(state_df, "data.struct")
     data_prefix = "data.struct" if has_struct_wrapper else "data"
 
-    # Draft states list (after mapping has been applied)
+    # Draft states list (old and new)
     draft_states = [
         "draft",
         "draft_pending_approval",
@@ -1893,9 +1898,7 @@ def _extract_state_fields_v2(state_df, state_col_name="data"):
         "validation_requested",
         "validation_failed",
         "allocation_requested",
-        "allocation_failed",
-        "takendown_pending_approval",
-        "pending_approval"
+        "allocation_failed"
     ]
 
     # Determine how to extract reasons based on field type
@@ -1952,17 +1955,27 @@ def _extract_state_fields_v2(state_df, state_col_name="data"):
             # Fallback: just extract the field
             reasons_expr = F.col(f"{data_prefix}.reasons").alias("state_reasons")
 
+    # Apply state type mapping
+    # First extract the source state type from data or fallback to state_type column
+    src_type_from_data = F.col(f"{data_prefix}.type")
+    src_type_str = F.coalesce(src_type_from_data, F.col("state_type").cast("string"))
+    
+    # Apply STATE_TYPE_MAP
+    mapping_map = F.create_map(*sum([[F.lit(k), F.lit(v)] for k, v in STATE_TYPE_MAP.items()], []))
+    src_lc = F.lower(src_type_str)
+    mapped_state_type = F.coalesce(mapping_map.getItem(src_lc), src_lc).cast("string")
+    
     return state_df.select(
         LISTING_ID_COL,
-        # Use the top-level state_type column directly
-        F.col("state_type").alias("state_type"),
-        # Calculate stage from state_type
-        F.when(F.col("state_type").isNotNull(),
-            F.when(F.col("state_type").isin(draft_states), F.lit("draft"))
-             .when(F.col("state_type").startswith("live"), F.lit("live"))
-             .when(F.col("state_type").startswith("takendown"), F.lit("takendown"))
-             .when(F.col("state_type").startswith("archived"), F.lit("archived"))
-             .otherwise(F.col("state_type"))
+        # Use mapped state_type
+        mapped_state_type.alias("state_type"),
+        # Calculate stage from mapped state_type (use the mapped value for stage calculation)
+        F.when(mapped_state_type.isNotNull(),
+            F.when(mapped_state_type.isin(draft_states), F.lit("draft"))
+             .when(mapped_state_type.startswith("live"), F.lit("live"))
+             .when(mapped_state_type.startswith("takendown"), F.lit("takendown"))
+             .when(mapped_state_type.startswith("archived"), F.lit("archived"))
+             .otherwise(mapped_state_type)
         ).alias("state_stage"),
         # Extract reasons with appropriate handling based on type
         reasons_expr
@@ -4349,18 +4362,6 @@ def run_search_only(args, glueContext):
     _log(logger, f"[SEARCH v2] Resolved scope -> run_all={run_all}, listing_count={len(test_listing_ids)}, client_count={len(test_client_ids)}")
     _log(logger, f"[SEARCH v2] Country: {country_code}, Source: {source_listings_table}, Target: {target_search_agg_table}")
 
-    # MEDIA
-    # migrate_media_to_search_aggregator_v2(
-    #     glueContext,
-    #     country_code=country_code,
-    #     source_listings_table=source_listings_table,
-    #     source_region=source_region,
-    #     target_search_aggregator_table=target_search_agg_table,
-    #     target_region=target_region,
-    #     test_listing_ids=test_listing_ids,
-    #     test_client_ids=test_client_ids,
-    #     run_all=run_all,
-    # )
 
     # CATALOG
     _log(logger, "\n[SEARCH] Step 1/1: Migrating CATALOG segment to search aggregator...")
