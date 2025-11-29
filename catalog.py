@@ -356,10 +356,24 @@ def delete_catalog_for_country(
     test_client_ids=None,
     source_listings_table=None,
     source_region=None,
+    segments_to_delete=None,
 ):
     """
-    Delete all catalog entries for a specific country.
-    If test IDs are provided, only delete those specific listings.
+    Delete catalog entries for a specific country.
+    
+    Args:
+        glueContext: Glue context
+        logger: Logger instance
+        country_code: Country code (e.g., "AE", "SA")
+        target_catalog_table: Target catalog table name
+        target_region: Target region
+        test_listing_ids: Optional list of listing IDs to delete
+        test_client_ids: Optional list of client IDs (will look up listing IDs)
+        source_listings_table: Source listings table (needed for client ID lookup)
+        source_region: Source region (needed for client ID lookup)
+        segments_to_delete: Optional list of segments to delete (e.g., ["AMENITIES", "PRICE"])
+                           If None, deletes ALL segments. If provided, only deletes specified segments.
+                           Examples: ["AMENITIES"], ["PRICE", "ATTRIBUTES"], ["STATE"]
     """
     msg = "[DELETE] Starting deletion for country: " + str(country_code)
     print(msg)
@@ -418,6 +432,21 @@ def delete_catalog_for_country(
         logger.info(msg)
         df = df.filter(F.col(CATALOG_ID_COL).isin(expected_ids))
         msg = "[DELETE] Applied listing ID filter"
+        print(msg)
+        logger.info(msg)
+
+    # Apply segment filter if provided
+    if segments_to_delete:
+        segment_values = ["SEGMENT#" + seg for seg in segments_to_delete]
+        msg = "[DELETE] Filtering by segments: " + str(segments_to_delete)
+        print(msg)
+        logger.info(msg)
+        df = df.filter(F.col(SEGMENT_COL).isin(segment_values))
+        msg = "[DELETE] Will delete only specified segments: " + str(segments_to_delete)
+        print(msg)
+        logger.info(msg)
+    else:
+        msg = "[DELETE] No segment filter - will delete ALL segments for matched listings"
         print(msg)
         logger.info(msg)
 
