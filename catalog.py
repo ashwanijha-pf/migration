@@ -641,7 +641,7 @@ STATE_TYPE_MAP = {
     # transforms
     "pending_approval": "draft_pending_approval",
     "publishing_failed": "allocation_failed",
-    "takendown_changes_publishing_failed": "allocation_failed",
+    "takendown_changes_publishing_failed": "takendown_allocation_failed",
     "takendown_changes_pending_approval": "takendown_pending_approval",
     "pending_publishing": "validation_requested",
     "live_changes_publishing_failed": "live_changes_allocation_failed",
@@ -650,9 +650,16 @@ STATE_TYPE_MAP = {
     "live_pending_deletion": "live_delete_requested",
     "live_pending_unpublishing": "live_deallocation_requested",
     "live_deletion_failed": "live_delete_failed",
-    "takendown_changes_pending_publishing": "validation_requested",
+    "takendown_changes_pending_publishing": "takendown_validation_requested",
+    "approved": "draft",
+    "live_boosting_failed": "live_boosting_failed",
+    "takendown_pending_archiving": "archived",
+    "live_changes_approved": "live",
+    "takendown_changes_rejected": "takendown",
+    "takendown_pending_deletion": "takendown"
 }
 
+#    "takendown_pending_archiving, takendown_pending_deletion": "archived", # It can also fail and stay on takendown, fix them manually
 # Draft states for stage calculation
 DRAFT_STATES = [
     "draft",

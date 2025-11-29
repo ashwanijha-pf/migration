@@ -41,7 +41,7 @@ STATE_TYPE_MAP = {
     # transforms
     "pending_approval": "draft_pending_approval",
     "publishing_failed": "allocation_failed",
-    "takendown_changes_publishing_failed": "allocation_failed",
+    "takendown_changes_publishing_failed": "takendown_allocation_failed",
     "takendown_changes_pending_approval": "takendown_pending_approval",
     "pending_publishing": "validation_requested",
     "live_changes_publishing_failed": "live_changes_allocation_failed",
@@ -50,7 +50,13 @@ STATE_TYPE_MAP = {
     "live_pending_deletion": "live_delete_requested",
     "live_pending_unpublishing": "live_deallocation_requested",
     "live_deletion_failed": "live_delete_failed",
-    "takendown_changes_pending_publishing": "validation_requested",
+    "takendown_changes_pending_publishing": "takendown_validation_requested",
+    "approved": "draft",
+    "live_boosting_failed": "live_boosting_failed",
+    "takendown_pending_archiving": "archived",
+    "live_changes_approved": "live",
+    "takendown_changes_rejected": "takendown",
+    "takendown_pending_deletion": "takendown"
 }
 
 # ---------- Optimized DynamoDB Operations ----------
@@ -1527,6 +1533,8 @@ def _extract_attr_fields_v2(attr_df):
 
         # Land/plot fields
         safe_col(f"{data_prefix}.land_number", "landNumber"),
+        safe_col(f"{data_prefix}.living_rooms", "livingRooms"),
+        safe_col(f"{data_prefix}.moj_deed_location_description", "mojDeedLocationDescription"),
         safe_col(f"{data_prefix}.number_of_floors", "numberOfFloors"),
         safe_col(f"{data_prefix}.plot_number", "plotNumber"),
         safe_col(f"{data_prefix}.plot_size", "plotSize"),
@@ -1886,7 +1894,8 @@ def _extract_state_fields_v2(state_df, state_col_name="data"):
         "validation_failed",
         "allocation_requested",
         "allocation_failed",
-        "takendown_pending_approval"
+        "takendown_pending_approval",
+        "pending_approval"
     ]
 
     # Determine how to extract reasons based on field type
@@ -2663,6 +2672,13 @@ def migrate_catalog_segment_to_search_aggregator_v2(
     if "data" in price.columns and isinstance(price.schema["data"].dataType, StringType):
         # PRICE: Use explicit schema to ensure all amounts fields are captured
         from pyspark.sql.types import StructType, StructField, StringType, LongType, BooleanType, ArrayType
+
+        # Define struct schema for mortgage, obligation, and value_affected
+        comment_enabled_schema = StructType([
+            StructField("comment", StringType(), True),
+            StructField("enabled", BooleanType(), True)
+        ])
+
         price_schema = StructType([
             StructField("FilterAmount", LongType(), True),
             StructField("SortAmount", LongType(), True),
@@ -2675,15 +2691,15 @@ def migrate_catalog_segment_to_search_aggregator_v2(
             ]), True),
             StructField("downpayment", LongType(), True),
             StructField("minimal_rental_period", StringType(), True),
-            StructField("mortgage", StringType(), True),
+            StructField("mortgage", comment_enabled_schema, True),
             StructField("number_of_cheques", LongType(), True),
             StructField("number_of_mortgage_years", LongType(), True),
-            StructField("obligation", StringType(), True),
+            StructField("obligation", comment_enabled_schema, True),
             StructField("on_request", BooleanType(), True),
             StructField("payment_methods", ArrayType(StringType(), True), True),
             StructField("type", StringType(), True),
             StructField("utilities_inclusive", BooleanType(), True),
-            StructField("value_affected", StringType(), True),
+            StructField("value_affected", comment_enabled_schema, True),
         ])
         _log(logger, f"[SEARCH_CATALOG] PRICE data parsing with explicit schema including all amounts fields")
         price = price.withColumn("data", F.from_json(F.col("data"), price_schema))
@@ -2882,12 +2898,12 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         # Numeric fields - extract value from struct or use direct value
         .withColumn("parkingSlots",
                     F.when(F.col("parkingSlots").isNotNull(),
-                           F.col("parkingSlots").cast("int")))
+                           F.col("parkingSlots").cast("int")).otherwise(F.lit(None).cast("int")))
 
         # Size is already unwrapped in _extract_attr_fields_v2 and cast to double, keep as double/float
         .withColumn("size",
                     F.when(F.col("size").isNotNull(),
-                           F.col("size").cast("double")))
+                           F.col("size").cast("double")).otherwise(F.lit(None).cast("double")))
 
         # numberOfFloors - preserve null values explicitly
         .withColumn("numberOfFloors",
@@ -2949,9 +2965,11 @@ def migrate_catalog_segment_to_search_aggregator_v2(
             F.when(F.col("price_on_request").isNotNull(), F.col("price_on_request").cast("boolean")).alias("onRequest"),
             F.when(F.col("price_filter_amount").isNotNull(), F.col("price_filter_amount")).alias("filter_amount"),
             F.when(F.col("price_sort_amount").isNotNull(), F.col("price_sort_amount")).alias("sort_amount"),
-            F.when(F.col("price_obligation").isNotNull(), F.col("price_obligation")).alias("obligation"),
-            F.when(F.col("price_mortgage").isNotNull(), F.col("price_mortgage")).alias("mortgage"),
-            F.when(F.col("price_value_affected").isNotNull(), F.col("price_value_affected")).alias("valueAffected"),
+            # Always include these structs, even if empty (comment="" and enabled=false)
+            # This ensures obligation, mortgage, and valueAffected are present in output
+            F.col("price_obligation").alias("obligation"),
+            F.col("price_mortgage").alias("mortgage"),
+            F.col("price_value_affected").alias("valueAffected"),
         ))
 
         .withColumn("createdAt", F.col("created_at").cast("string"))
@@ -3008,7 +3026,9 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         F.col("hasParkingOnSite"),
         F.col("id"),
         F.col("landNumber"),
+        F.col("livingRooms"),
         F.col("location_struct").alias("location"),
+        F.col("mojDeedLocationDescription"),
         F.when(F.col("numberOfFloors").isNotNull(), F.col("numberOfFloors")).alias("numberOfFloors"),
         F.col("ownerName"),
         F.col("parkingSlots"),
@@ -3019,7 +3039,7 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         F.when(F.col("publishedAt").isNotNull(), F.col("publishedAt")).alias("publishedAt"),
         F.col("street"),
         F.coalesce(F.col("meta_reference"), F.col("id")).alias("reference"),
-        F.col("size"),
+        F.when(F.col("size").isNotNull(), F.col("size")).alias("size"),
         F.col("state_struct").alias("state"),
         F.col("title_struct").alias("title"),
         F.col("type"),
