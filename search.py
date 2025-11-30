@@ -1497,7 +1497,10 @@ def _extract_attr_fields_v2(attr_df):
     # Helper to safely get field or return None
     def safe_col(field_path, alias_name, cast_type="string"):
         if has_nested_field(attr_df, field_path):
-            return F.col(field_path).alias(alias_name)
+            col_expr = F.col(field_path)
+            if cast_type != "string":
+                col_expr = col_expr.cast(cast_type)
+            return col_expr.alias(alias_name)
         else:
             return F.lit(None).cast(cast_type).alias(alias_name)
 
@@ -1541,8 +1544,7 @@ def _extract_attr_fields_v2(attr_df):
 
         safe_col(f"{data_prefix}.parking_slots", "parkingSlots"),
         safe_col(f"{data_prefix}.project_status", "projectStatus"),
-        # Size field - extract as-is, will unwrap later if needed
-        safe_col(f"{data_prefix}.size", "size_raw"),
+        extract_numeric_value(f"{data_prefix}.size").alias("size"),
         # Transform street field - create struct with width (int) and direction (string)
         # Source has street.Width and street.Direction, output should be street: {width: N, direction: "X"}
         # Handle both cases: street as struct (STRUCT<Direction: STRING, Width: BIGINT>) or as JSON string
@@ -1580,29 +1582,6 @@ def _extract_attr_fields_v2(attr_df):
 
     # First select all columns
     result_df = attr_df.select(*select_cols)
-
-    # Check the actual schema of size_raw to determine how to handle it
-    from pyspark.sql.types import StructType
-    size_raw_type = result_df.schema["size_raw"].dataType
-
-    print(f"[DEBUG] size_raw schema type: {size_raw_type}")
-    print(f"[DEBUG] is StructType: {isinstance(size_raw_type, StructType)}")
-
-    # Build the appropriate expression based on the schema
-    if isinstance(size_raw_type, StructType):
-        # It's a struct, unwrap it and cast to double
-        print("[DEBUG] Unwrapping size as struct")
-        size_expr = F.coalesce(
-            F.col("size_raw.double"),
-            F.col("size_raw.long").cast("double")
-        )
-    else:
-        # It's already a primitive, cast to double for consistency
-        print("[DEBUG] Using size as primitive, casting to double")
-        size_expr = F.col("size_raw").cast("double")
-
-    # Apply the transformation
-    result_df = result_df.withColumn("size", size_expr).drop("size_raw")
 
     # Debug: Check if ownerName is populated
     sample_owner = result_df.select(LISTING_ID_COL, "ownerName").limit(3).collect()
@@ -1753,6 +1732,9 @@ def _extract_price_fields_v2(price_df):
 
         # SortAmount - DECIMAL/NUMBER (used for sorting)
         safe_col(f"{data_prefix}.SortAmount", "price_sort_amount", "decimal(20,2)"),
+
+        # Minimal rental period - INT (minimum rental period in months)
+        safe_col(f"{data_prefix}.minimal_rental_period", "price_minimal_rental_period", "int"),
 
         # Obligation - struct with comment and enabled (optional field, only in some countries like SA)
         # Skip this field for now - will be added later if it exists
@@ -2638,6 +2620,10 @@ def migrate_catalog_segment_to_search_aggregator_v2(
     if "first_published_at" in base.columns:
         base_cols_to_aggregate.append("first_published_at")
 
+    # Add published_at only if it exists (it's only in METADATA segment)
+    if "published_at" in base.columns:
+        base_cols_to_aggregate.append("published_at")
+
     base_cols = _group_first_non_null_v2(
         base, LISTING_ID_COL,
         base_cols_to_aggregate
@@ -2651,33 +2637,37 @@ def migrate_catalog_segment_to_search_aggregator_v2(
     from pyspark.sql.types import StringType
 
     # Parse 'data' field per segment (each segment has consistent data type)
-    # Use schema_of_json to infer the correct schema from sample data
+    # Scan ALL records to build complete schema - ensures no optional fields are lost
     if "data" in attr.columns and isinstance(attr.schema["data"].dataType, StringType):
-        # ATTRIBUTES: Infer schema from MULTIPLE samples to capture all fields (e.g., owner_name)
-        # Single sample may miss optional fields that aren't present in every record
+        # ATTRIBUTES: Build schema from ALL records to capture every possible field (e.g., owner_name)
+        # This is critical because optional fields may only exist in a small % of records
         import json
-        sample_jsons = attr.filter(F.col("data").isNotNull()).select("data").limit(50).collect()
-        if sample_jsons:
-            # Merge schemas from multiple samples
-            merged_schema = {}
-            for row in sample_jsons:
-                if row[0]:
-                    try:
-                        obj = json.loads(row[0])
-                        if isinstance(obj, dict):
-                            # Merge keys - keep any non-null value as example
-                            for k, v in obj.items():
-                                if k not in merged_schema or merged_schema[k] is None:
-                                    merged_schema[k] = v
-                    except:
-                        pass
-
-            if merged_schema:
-                merged_json = json.dumps(merged_schema)
-                inferred_schema = F.schema_of_json(F.lit(merged_json))
-                _log(logger, f"[SEARCH_CATALOG] ATTRIBUTES data schema inferred from {len(sample_jsons)} samples")
-                _log(logger, f"[SEARCH_CATALOG] ATTRIBUTES merged schema keys: {list(merged_schema.keys())}")
-                attr = attr.withColumn("data", F.from_json(F.col("data"), inferred_schema))
+        _log(logger, "[SEARCH_CATALOG] Building complete ATTRIBUTES schema from all records...")
+        
+        # Collect ALL unique keys from ALL records (not just a sample)
+        all_jsons = attr.filter(F.col("data").isNotNull()).select("data").collect()
+        merged_schema = {}
+        
+        for row in all_jsons:
+            if row[0]:
+                try:
+                    obj = json.loads(row[0])
+                    if isinstance(obj, dict):
+                        # Merge keys - keep any non-null value as example
+                        for k, v in obj.items():
+                            if k not in merged_schema or merged_schema[k] is None:
+                                merged_schema[k] = v
+                except:
+                    pass
+        
+        if merged_schema:
+            merged_json = json.dumps(merged_schema)
+            inferred_schema = F.schema_of_json(F.lit(merged_json))
+            _log(logger, f"[SEARCH_CATALOG] ATTRIBUTES complete schema built from {len(all_jsons)} records")
+            _log(logger, f"[SEARCH_CATALOG] ATTRIBUTES schema includes fields: {sorted(list(merged_schema.keys()))}")
+            attr = attr.withColumn("data", F.from_json(F.col("data"), inferred_schema))
+        else:
+            _log(logger, "[SEARCH_CATALOG] WARNING: No ATTRIBUTES data found to build schema")
 
     if "description" in desc.columns and isinstance(desc.schema["description"].dataType, StringType):
         desc = desc.withColumn("description", F.from_json(F.col("description"), "map<string,string>"))
@@ -2906,17 +2896,12 @@ def migrate_catalog_segment_to_search_aggregator_v2(
         .withColumn("id", F.col(LISTING_ID_COL))
         .withColumn("availableFrom",
                     F.when(F.col("availableFrom").isNotNull(),
-                           F.date_format(F.to_timestamp("availableFrom"), "yyyy-MM-dd")))
+                           F.substring(F.col("availableFrom"), 1, 10)))
 
         # Numeric fields - extract value from struct or use direct value
         .withColumn("parkingSlots",
                     F.when(F.col("parkingSlots").isNotNull(),
                            F.col("parkingSlots").cast("int")).otherwise(F.lit(None).cast("int")))
-
-        # Size is already unwrapped in _extract_attr_fields_v2 and cast to double, keep as double/float
-        .withColumn("size",
-                    F.when(F.col("size").isNotNull(),
-                           F.col("size").cast("double")).otherwise(F.lit(None).cast("double")))
 
         # numberOfFloors - preserve null values explicitly
         .withColumn("numberOfFloors",
@@ -2973,6 +2958,7 @@ def migrate_catalog_segment_to_search_aggregator_v2(
             F.coalesce(F.col("price_downpayment"), F.lit(0).cast("long")).alias("downpayment"),
             F.when(pm_arr.isNotNull(), pm_arr).otherwise(F.array()).alias("paymentMethods"),
             F.when(F.col("price_utilities_inclusive").isNotNull(), F.col("price_utilities_inclusive").cast("boolean")).alias("utilitiesInclusive"),
+            F.when(F.col("price_minimal_rental_period").isNotNull(), F.col("price_minimal_rental_period").cast("int")).alias("minimalRentalPeriod"),
             F.col("price_number_years").alias("numberOfMortgageYears"),
             F.col("price_number_of_cheques").alias("numberOfCheques"),
             F.when(F.col("price_on_request").isNotNull(), F.col("price_on_request").cast("boolean")).alias("onRequest"),
